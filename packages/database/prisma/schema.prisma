@@ -1,0 +1,814 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+
+enum SystemRole {
+  USER
+  ADMIN
+  FINANCE_VIEWER
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+enum LpMembershipRole {
+  LP_ADMIN
+  LP_MANAGER
+  LP_VIEWER
+}
+
+enum StoreOrgMembershipRole {
+  STORE_ORG_ADMIN
+  STORE_ORG_MANAGER
+  STORE_ORG_VIEWER
+}
+
+enum AccessRequestType {
+  LP_ACCESS
+  STORE_ORG_ACCESS
+}
+
+enum AccessRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELED
+}
+
+enum InvitationStatus {
+  PENDING
+  ACCEPTED
+  EXPIRED
+  REVOKED
+}
+
+enum FileKind {
+  LP_UPLOAD
+  STORE_UPLOAD
+  GENERATED_STATEMENT
+  GENERATED_REPORT
+}
+
+enum BatchSourceType {
+  LP
+  STORE
+}
+
+enum ImportBatchStatus {
+  RECEIVED
+  PREVALIDATION_FAILED
+  VALIDATING
+  VALIDATION_FAILED
+  STAGED
+  WAITING_FOR_COUNTERPART
+  READY_FOR_RECONCILIATION
+  RECONCILING
+  RECONCILED
+  FAILED
+  CANCELED
+}
+
+enum ParseStatus {
+  PENDING
+  PARSED
+  FAILED
+  SKIPPED
+}
+
+enum CycleStatus {
+  AWAITING_UPLOADS
+  PROCESSING
+  READY_FOR_RECONCILIATION
+  RECONCILING
+  MISMATCHES_FOUND
+  RECONCILIATION_PASSED
+  STATEMENT_PENDING
+  STATEMENT_GENERATING
+  STATEMENT_READY
+  FAILED
+}
+
+enum ReconciliationStatus {
+  MATCHED
+  MISMATCH
+  LP_ONLY
+  STORE_ONLY
+  WAIVED
+}
+
+enum MismatchType {
+  MISSING_COUNTERPART
+  FIELD_DIFFERENCE
+  PRICE_FORMULA_FALLBACK
+  DUPLICATE_ROW
+  BUSINESS_RULE_VIOLATION
+  BARCODE_NORMALIZATION_REQUIRED
+  MANUAL_REVIEW_REQUIRED
+}
+
+enum MismatchStatus {
+  OPEN
+  RESOLVED
+  WAIVED
+}
+
+enum ResolutionAction {
+  ACCEPT_LP
+  ACCEPT_STORE
+  MANUAL_OVERRIDE
+  WAIVE
+  COMMENT_ONLY
+  REPROCESS_REQUESTED
+}
+
+enum StatementTaskStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  CANCELED
+}
+
+enum StatementStatus {
+  DRAFT
+  FINAL
+  FAILED
+}
+
+enum NotificationType {
+  INVITATION
+  ACCESS_REQUEST_DECISION
+  MISSING_UPLOAD_REMINDER
+  MISMATCH_ASSIGNED
+  MISMATCH_RESOLVED
+  STATEMENT_READY
+  SYSTEM_ALERT
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+enum AuditActorType {
+  USER
+  SYSTEM
+}
+
+model User {
+  id            String       @id @default(uuid()) @db.Uuid
+  name          String?
+  email         String       @unique
+  emailVerified DateTime?
+  image         String?
+  passwordHash  String?
+  systemRole    SystemRole   @default(USER)
+  status        UserStatus   @default(ACTIVE)
+  lastLoginAt   DateTime?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  accounts                Account[]
+  sessions                Session[]
+  lpMemberships           LpMembership[]
+  storeOrgMemberships     StoreOrgMembership[]
+  reviewedAccessRequests  AccessRequest[]      @relation("AccessRequestReviewedBy")
+  sentInvitations         Invitation[]         @relation("InvitationSentBy")
+  uploadedFiles           UploadedFile[]       @relation("FileUploadedBy")
+  importBatches           ImportBatch[]        @relation("BatchUploadedBy")
+  resolvedMismatches      Mismatch[]           @relation("MismatchResolvedBy")
+  mismatchResolutions     MismatchResolution[] @relation("ResolutionCreatedBy")
+  requestedStatementTasks StatementTask[]      @relation("StatementTaskRequestedBy")
+  notifications           Notification[]
+  auditLogs               AuditLog[]           @relation("AuditActor")
+  emailVerificationCodes  EmailVerificationCode[]
+
+  @@index([systemRole])
+  @@index([status])
+}
+
+model Account {
+  id                String  @id @default(uuid()) @db.Uuid
+  userId            String  @db.Uuid
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id           String   @id @default(uuid()) @db.Uuid
+  sessionToken String   @unique
+  userId       String   @db.Uuid
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+model EmailVerificationCode {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @db.Uuid
+  codeHash  String
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([userId, usedAt])
+  @@index([userId, expiresAt])
+}
+
+model LP {
+  id          String   @id @default(uuid()) @db.Uuid
+  code        String?  @unique
+  name        String
+  legalName   String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  memberships      LpMembership[]
+  storeAssignments StoreLocationLpAssignment[]
+  accessRequests   AccessRequest[]
+  invitations      Invitation[]
+  categoryRules    CategoryRule[]
+  productScaleRules ProductScaleRule[]
+  cycles           ReconciliationCycle[]
+
+  @@index([isActive])
+  @@index([name])
+}
+
+model StoreOrganization {
+  id          String   @id @default(uuid()) @db.Uuid
+  code        String?  @unique
+  name        String
+  legalName   String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  memberships    StoreOrgMembership[]
+  locations      StoreLocation[]
+  accessRequests AccessRequest[]
+  invitations    Invitation[]
+
+  @@index([isActive])
+  @@index([name])
+}
+
+model StoreLocation {
+  id                  String   @id @default(uuid()) @db.Uuid
+  storeOrganizationId String   @db.Uuid
+  code                String?
+  name                String
+  addressLine1        String
+  addressLine2        String?
+  city                String
+  province            String
+  postalCode          String
+  country             String   @default("CA")
+  isActive            Boolean  @default(true)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  storeOrganization StoreOrganization         @relation(fields: [storeOrganizationId], references: [id], onDelete: Cascade)
+  lpAssignments      StoreLocationLpAssignment[]
+  cycles             ReconciliationCycle[]
+
+  @@unique([storeOrganizationId, code])
+  @@index([storeOrganizationId])
+  @@index([isActive])
+}
+
+model LpMembership {
+  id         String           @id @default(uuid()) @db.Uuid
+  userId     String           @db.Uuid
+  lpId       String           @db.Uuid
+  role       LpMembershipRole
+  createdAt  DateTime         @default(now())
+  updatedAt  DateTime         @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  lp   LP   @relation(fields: [lpId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, lpId])
+  @@index([lpId, role])
+}
+
+model StoreOrgMembership {
+  id                  String                 @id @default(uuid()) @db.Uuid
+  userId              String                 @db.Uuid
+  storeOrganizationId String                 @db.Uuid
+  role                StoreOrgMembershipRole
+  createdAt           DateTime               @default(now())
+  updatedAt           DateTime               @updatedAt
+
+  user              User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  storeOrganization StoreOrganization @relation(fields: [storeOrganizationId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, storeOrganizationId])
+  @@index([storeOrganizationId, role])
+}
+
+model AccessRequest {
+  id                    String              @id @default(uuid()) @db.Uuid
+  type                  AccessRequestType
+  status                AccessRequestStatus @default(PENDING)
+  requesterName         String
+  requesterEmail        String
+  requestedCompanyName  String?
+  message               String?
+  lpId                  String?             @db.Uuid
+  storeOrganizationId   String?             @db.Uuid
+  reviewedByUserId      String?             @db.Uuid
+  reviewNotes           String?
+  submittedAt           DateTime            @default(now())
+  reviewedAt            DateTime?
+  createdAt             DateTime            @default(now())
+  updatedAt             DateTime            @updatedAt
+
+  lp                LP?               @relation(fields: [lpId], references: [id], onDelete: SetNull)
+  storeOrganization StoreOrganization? @relation(fields: [storeOrganizationId], references: [id], onDelete: SetNull)
+  reviewedBy        User?             @relation("AccessRequestReviewedBy", fields: [reviewedByUserId], references: [id], onDelete: SetNull)
+
+  @@index([type, status])
+  @@index([requesterEmail])
+}
+
+model Invitation {
+  id                  String                 @id @default(uuid()) @db.Uuid
+  email               String
+  status              InvitationStatus       @default(PENDING)
+  tokenHash           String                 @unique
+  expiresAt           DateTime
+  acceptedAt          DateTime?
+  invitedByUserId     String?                @db.Uuid
+  lpId                String?                @db.Uuid
+  storeOrganizationId String?                @db.Uuid
+  lpRole              LpMembershipRole?
+  storeOrgRole        StoreOrgMembershipRole?
+  note                String?
+  createdAt           DateTime               @default(now())
+  updatedAt           DateTime               @updatedAt
+
+  invitedBy         User?              @relation("InvitationSentBy", fields: [invitedByUserId], references: [id], onDelete: SetNull)
+  lp                LP?                @relation(fields: [lpId], references: [id], onDelete: Cascade)
+  storeOrganization StoreOrganization? @relation(fields: [storeOrganizationId], references: [id], onDelete: Cascade)
+
+  @@index([email, status])
+  @@index([lpId])
+  @@index([storeOrganizationId])
+}
+
+model StoreLocationLpAssignment {
+  id              String   @id @default(uuid()) @db.Uuid
+  storeLocationId String   @db.Uuid
+  lpId            String   @db.Uuid
+  isActive        Boolean  @default(true)
+  startsOn        DateTime? @db.Date
+  endsOn          DateTime? @db.Date
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  storeLocation StoreLocation @relation(fields: [storeLocationId], references: [id], onDelete: Cascade)
+  lp            LP            @relation(fields: [lpId], references: [id], onDelete: Cascade)
+
+  @@unique([storeLocationId, lpId])
+  @@index([lpId, isActive])
+}
+
+model ReconciliationCycle {
+  id              String      @id @default(uuid()) @db.Uuid
+  lpId            String      @db.Uuid
+  storeLocationId String      @db.Uuid
+  periodMonth     DateTime    @db.Date
+  status          CycleStatus @default(AWAITING_UPLOADS)
+  lastError       String?
+  reconciliationPassedAt DateTime?
+  statementReadyAt       DateTime?
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  lp              LP                   @relation(fields: [lpId], references: [id], onDelete: Cascade)
+  storeLocation   StoreLocation        @relation(fields: [storeLocationId], references: [id], onDelete: Cascade)
+  importBatches   ImportBatch[]
+  normalizedLpRows    NormalizedLpRow[]
+  normalizedStoreRows NormalizedStoreRow[]
+  reconciliationResults ReconciliationResult[]
+  mismatches      Mismatch[]
+  statementTasks  StatementTask[]
+  statements      Statement[]
+  auditLogs       AuditLog[]
+
+  @@unique([lpId, storeLocationId, periodMonth])
+  @@index([status])
+  @@index([periodMonth])
+}
+
+model UploadedFile {
+  id               String    @id @default(uuid()) @db.Uuid
+  fileKind         FileKind
+  bucket           String
+  storagePath      String
+  originalFilename String
+  mimeType         String?
+  sizeBytes        BigInt
+  checksumSha256   String?
+  uploadedByUserId String?   @db.Uuid
+  uploadedAt       DateTime  @default(now())
+  deletedAt        DateTime?
+
+  uploadedBy User? @relation("FileUploadedBy", fields: [uploadedByUserId], references: [id], onDelete: SetNull)
+
+  importBatch       ImportBatch?
+  generatedStatements Statement[] @relation("StatementGeneratedFile")
+
+  @@index([fileKind])
+  @@index([uploadedByUserId])
+}
+
+model ImportBatch {
+  id               String            @id @default(uuid()) @db.Uuid
+  cycleId          String            @db.Uuid
+  uploadedFileId   String            @unique @db.Uuid
+  sourceType       BatchSourceType
+  status           ImportBatchStatus @default(RECEIVED)
+  isCurrent        Boolean           @default(true)
+  uploadedByUserId String?           @db.Uuid
+  totalRowCount    Int?
+  validRowCount    Int?
+  invalidRowCount  Int?
+  preValidationErrors Json?
+  validationSummary Json?
+  processedAt      DateTime?
+  failedAt         DateTime?
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+
+  cycle        ReconciliationCycle @relation(fields: [cycleId], references: [id], onDelete: Cascade)
+  uploadedFile UploadedFile        @relation(fields: [uploadedFileId], references: [id], onDelete: Cascade)
+  uploadedBy   User?               @relation("BatchUploadedBy", fields: [uploadedByUserId], references: [id], onDelete: SetNull)
+
+  rawLpRows          RawLpRow[]
+  rawStoreRows       RawStoreRow[]
+  normalizedLpRows   NormalizedLpRow[]
+  normalizedStoreRows NormalizedStoreRow[]
+  auditLogs          AuditLog[]
+
+  @@index([cycleId, sourceType])
+  @@index([status])
+}
+
+model RawLpRow {
+  id              String     @id @default(uuid()) @db.Uuid
+  importBatchId   String     @db.Uuid
+  sourceRowNumber Int
+  parseStatus     ParseStatus @default(PENDING)
+  rawData         Json
+  parseErrors     Json?
+  createdAt       DateTime   @default(now())
+
+  importBatch ImportBatch      @relation(fields: [importBatchId], references: [id], onDelete: Cascade)
+  normalizedRow NormalizedLpRow?
+
+  @@unique([importBatchId, sourceRowNumber])
+  @@index([parseStatus])
+}
+
+model RawStoreRow {
+  id              String      @id @default(uuid()) @db.Uuid
+  importBatchId   String      @db.Uuid
+  sourceRowNumber Int
+  parseStatus     ParseStatus @default(PENDING)
+  rawData         Json
+  parseErrors     Json?
+  createdAt       DateTime    @default(now())
+
+  importBatch ImportBatch         @relation(fields: [importBatchId], references: [id], onDelete: Cascade)
+  normalizedRow NormalizedStoreRow?
+
+  @@unique([importBatchId, sourceRowNumber])
+  @@index([parseStatus])
+}
+
+model NormalizedLpRow {
+  id                String   @id @default(uuid()) @db.Uuid
+  importBatchId     String   @db.Uuid
+  rawRowId          String   @unique @db.Uuid
+  cycleId           String   @db.Uuid
+  sourceRowNumber   Int
+  canonicalBarcode  String?
+  barcodeNormalized Boolean  @default(false)
+  productName       String?
+  categoryKey       String?
+  subCategoryKey    String?
+  salesAmount       Decimal? @db.Decimal(18, 4)
+  salesUnits        Decimal? @db.Decimal(18, 4)
+  unitPricePrimary  Decimal? @db.Decimal(18, 6)
+  unitPriceFallback Decimal? @db.Decimal(18, 6)
+  finalUnitPrice    Decimal? @db.Decimal(18, 6)
+  usedFallbackPrice Boolean  @default(false)
+  rowFingerprint    String?
+  normalizedData    Json?
+  createdAt         DateTime @default(now())
+
+  importBatch ImportBatch         @relation(fields: [importBatchId], references: [id], onDelete: Cascade)
+  rawRow      RawLpRow            @relation(fields: [rawRowId], references: [id], onDelete: Cascade)
+  cycle       ReconciliationCycle @relation(fields: [cycleId], references: [id], onDelete: Cascade)
+
+  reconciliationResults ReconciliationResult[] @relation("LpRowResults")
+
+  @@index([cycleId])
+  @@index([canonicalBarcode])
+}
+
+model NormalizedStoreRow {
+  id                String   @id @default(uuid()) @db.Uuid
+  importBatchId     String   @db.Uuid
+  rawRowId          String   @unique @db.Uuid
+  cycleId           String   @db.Uuid
+  sourceRowNumber   Int
+  canonicalBarcode  String?
+  barcodeNormalized Boolean  @default(false)
+  productName       String?
+  categoryKey       String?
+  subCategoryKey    String?
+  salesAmount       Decimal? @db.Decimal(18, 4)
+  salesUnits        Decimal? @db.Decimal(18, 4)
+  unitPricePrimary  Decimal? @db.Decimal(18, 6)
+  unitPriceFallback Decimal? @db.Decimal(18, 6)
+  finalUnitPrice    Decimal? @db.Decimal(18, 6)
+  usedFallbackPrice Boolean  @default(false)
+  rowFingerprint    String?
+  normalizedData    Json?
+  createdAt         DateTime @default(now())
+
+  importBatch ImportBatch         @relation(fields: [importBatchId], references: [id], onDelete: Cascade)
+  rawRow      RawStoreRow         @relation(fields: [rawRowId], references: [id], onDelete: Cascade)
+  cycle       ReconciliationCycle @relation(fields: [cycleId], references: [id], onDelete: Cascade)
+
+  reconciliationResults ReconciliationResult[] @relation("StoreRowResults")
+
+  @@index([cycleId])
+  @@index([canonicalBarcode])
+}
+
+model CategoryRule {
+  id                   String   @id @default(uuid()) @db.Uuid
+  lpId                 String   @db.Uuid
+  categoryKey          String
+  displayName          String?
+  maxScale             Decimal  @db.Decimal(18, 4)
+  maxCommissionPercent Decimal  @db.Decimal(7, 4)
+  isActive             Boolean  @default(true)
+  effectiveFrom        DateTime? @db.Date
+  effectiveTo          DateTime? @db.Date
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  lp                    LP                    @relation(fields: [lpId], references: [id], onDelete: Cascade)
+  productScaleRules     ProductScaleRule[]
+  reconciliationResults ReconciliationResult[]
+
+  @@index([lpId, categoryKey])
+  @@index([isActive])
+}
+
+model ProductScaleRule {
+  id                 String   @id @default(uuid()) @db.Uuid
+  lpId               String   @db.Uuid
+  categoryRuleId     String?  @db.Uuid
+  barcode            String
+  productNameSnapshot String?
+  productScale       Decimal  @db.Decimal(18, 4)
+  isActive           Boolean  @default(true)
+  effectiveFrom      DateTime? @db.Date
+  effectiveTo        DateTime? @db.Date
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  lp            LP            @relation(fields: [lpId], references: [id], onDelete: Cascade)
+  categoryRule  CategoryRule? @relation(fields: [categoryRuleId], references: [id], onDelete: SetNull)
+  reconciliationResults ReconciliationResult[]
+
+  @@index([lpId, barcode])
+  @@index([isActive])
+}
+
+model ReconciliationResult {
+  id                         String               @id @default(uuid()) @db.Uuid
+  cycleId                    String               @db.Uuid
+  lpRowId                    String?              @db.Uuid
+  storeRowId                 String?              @db.Uuid
+  status                     ReconciliationStatus
+  barcode                    String?
+  productName                String?
+  categoryKey                String?
+  lpSalesAmount              Decimal?             @db.Decimal(18, 4)
+  lpSalesUnits               Decimal?             @db.Decimal(18, 4)
+  storeSalesAmount           Decimal?             @db.Decimal(18, 4)
+  storeSalesUnits            Decimal?             @db.Decimal(18, 4)
+  chosenUnitPrice            Decimal?             @db.Decimal(18, 6)
+  categoryRuleId             String?              @db.Uuid
+  productScaleRuleId         String?              @db.Uuid
+  calculatedCommissionPercent Decimal?            @db.Decimal(7, 4)
+  calculatedCommissionAmount Decimal?             @db.Decimal(18, 4)
+  details                    Json?
+  createdAt                  DateTime             @default(now())
+  updatedAt                  DateTime             @updatedAt
+
+  cycle            ReconciliationCycle @relation(fields: [cycleId], references: [id], onDelete: Cascade)
+  lpRow            NormalizedLpRow?    @relation("LpRowResults", fields: [lpRowId], references: [id], onDelete: SetNull)
+  storeRow         NormalizedStoreRow? @relation("StoreRowResults", fields: [storeRowId], references: [id], onDelete: SetNull)
+  categoryRule     CategoryRule?       @relation(fields: [categoryRuleId], references: [id], onDelete: SetNull)
+  productScaleRule ProductScaleRule?   @relation(fields: [productScaleRuleId], references: [id], onDelete: SetNull)
+
+  mismatches   Mismatch[]
+  lineItems    StatementLineItem[]
+
+  @@index([cycleId, status])
+  @@index([barcode])
+}
+
+model Mismatch {
+  id                     String         @id @default(uuid()) @db.Uuid
+  cycleId                String         @db.Uuid
+  reconciliationResultId String?        @db.Uuid
+  type                   MismatchType
+  status                 MismatchStatus @default(OPEN)
+  fieldName              String?
+  message                String
+  details                Json?
+  resolvedByUserId       String?        @db.Uuid
+  resolvedAt             DateTime?
+  createdAt              DateTime       @default(now())
+  updatedAt              DateTime       @updatedAt
+
+  cycle                ReconciliationCycle @relation(fields: [cycleId], references: [id], onDelete: Cascade)
+  reconciliationResult ReconciliationResult? @relation(fields: [reconciliationResultId], references: [id], onDelete: SetNull)
+  resolvedBy           User?               @relation("MismatchResolvedBy", fields: [resolvedByUserId], references: [id], onDelete: SetNull)
+
+  resolutions MismatchResolution[]
+
+  @@index([cycleId, status])
+  @@index([type])
+}
+
+model MismatchResolution {
+  id              String           @id @default(uuid()) @db.Uuid
+  mismatchId      String           @db.Uuid
+  createdByUserId String           @db.Uuid
+  action          ResolutionAction
+  comment         String?
+  payload         Json?
+  createdAt       DateTime         @default(now())
+
+  mismatch   Mismatch @relation(fields: [mismatchId], references: [id], onDelete: Cascade)
+  createdBy  User     @relation("ResolutionCreatedBy", fields: [createdByUserId], references: [id], onDelete: Cascade)
+
+  @@index([mismatchId])
+  @@index([createdByUserId])
+}
+
+model StatementTask {
+  id                String              @id @default(uuid()) @db.Uuid
+  cycleId           String              @db.Uuid
+  status            StatementTaskStatus @default(PENDING)
+  attemptCount      Int                 @default(0)
+  lastError         String?
+  requestedByUserId String?             @db.Uuid
+  startedAt         DateTime?
+  completedAt       DateTime?
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+
+  cycle       ReconciliationCycle @relation(fields: [cycleId], references: [id], onDelete: Cascade)
+  requestedBy User?               @relation("StatementTaskRequestedBy", fields: [requestedByUserId], references: [id], onDelete: SetNull)
+
+  statements Statement[]
+
+  @@index([cycleId, status])
+}
+
+model Statement {
+  id                   String          @id @default(uuid()) @db.Uuid
+  cycleId              String          @db.Uuid
+  taskId               String?         @db.Uuid
+  version              Int
+  status               StatementStatus @default(DRAFT)
+  currency             String          @default("CAD") @db.VarChar(3)
+  totalSalesAmount     Decimal?        @db.Decimal(18, 4)
+  totalSalesUnits      Decimal?        @db.Decimal(18, 4)
+  totalCommissionAmount Decimal?       @db.Decimal(18, 4)
+  generatedFileId      String?         @db.Uuid
+  generatedAt          DateTime?
+  createdAt            DateTime        @default(now())
+  updatedAt            DateTime        @updatedAt
+
+  cycle         ReconciliationCycle @relation(fields: [cycleId], references: [id], onDelete: Cascade)
+  task          StatementTask?      @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  generatedFile UploadedFile?       @relation("StatementGeneratedFile", fields: [generatedFileId], references: [id], onDelete: SetNull)
+
+  lineItems StatementLineItem[]
+
+  @@unique([cycleId, version])
+  @@index([taskId])
+}
+
+model StatementLineItem {
+  id                         String   @id @default(uuid()) @db.Uuid
+  statementId                String   @db.Uuid
+  reconciliationResultId     String?  @db.Uuid
+  barcode                    String?
+  productName                String?
+  categoryKey                String?
+  lpSalesUnits               Decimal? @db.Decimal(18, 4)
+  storeSalesUnits            Decimal? @db.Decimal(18, 4)
+  reconciledUnits            Decimal? @db.Decimal(18, 4)
+  unitPrice                  Decimal? @db.Decimal(18, 6)
+  categoryMaxScale           Decimal? @db.Decimal(18, 4)
+  categoryMaxCommissionPercent Decimal? @db.Decimal(7, 4)
+  productScale               Decimal? @db.Decimal(18, 4)
+  commissionPercent          Decimal? @db.Decimal(7, 4)
+  commissionAmount           Decimal? @db.Decimal(18, 4)
+  notes                      String?
+  sortOrder                  Int      @default(0)
+
+  statement            Statement            @relation(fields: [statementId], references: [id], onDelete: Cascade)
+  reconciliationResult ReconciliationResult? @relation(fields: [reconciliationResultId], references: [id], onDelete: SetNull)
+
+  @@index([statementId, sortOrder])
+}
+
+model Notification {
+  id                String             @id @default(uuid()) @db.Uuid
+  userId            String?            @db.Uuid
+  email             String
+  type              NotificationType
+  status            NotificationStatus @default(PENDING)
+  subject           String
+  payload           Json?
+  providerMessageId String?
+  sentAt            DateTime?
+  createdAt         DateTime           @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([status, type])
+  @@index([email])
+}
+
+model AuditLog {
+  id          String         @id @default(uuid()) @db.Uuid
+  actorType   AuditActorType
+  actorUserId String?        @db.Uuid
+  action      String
+  entityType  String
+  entityId    String
+  cycleId     String?        @db.Uuid
+  batchId     String?        @db.Uuid
+  metadata    Json?
+  createdAt   DateTime       @default(now())
+
+  actor User?               @relation("AuditActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+  cycle ReconciliationCycle? @relation(fields: [cycleId], references: [id], onDelete: SetNull)
+  batch ImportBatch?         @relation(fields: [batchId], references: [id], onDelete: SetNull)
+
+  @@index([entityType, entityId])
+  @@index([cycleId])
+  @@index([batchId])
+  @@index([createdAt])
+}
