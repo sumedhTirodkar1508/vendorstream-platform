@@ -1,7 +1,14 @@
 import Link from "next/link";
 import { getServerSession } from "next-auth";
 import { redirect } from "next/navigation";
+import {
+  prisma,
+  type CycleStatus,
+  type ImportBatchStatus,
+  type StatementStatus,
+} from "@vendorstream/database";
 import { authOptions } from "@/app/api/auth/[...nextauth]/options";
+import { Button } from "@/components/ui/button";
 import {
   Card,
   CardContent,
@@ -9,7 +16,8 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
+import { getLpAccessContextForUser } from "@/lib/lp-access-context";
+import { getStoreUploadContextForUser } from "@/lib/store-upload-context";
 
 type DashboardSummary = {
   label:
@@ -24,34 +32,60 @@ type DashboardSummary = {
 
 type RecentCycleRow = {
   id: string;
-  month: string;
+  monthLabel: string;
   lpName: string;
   storeLocation: string;
-  status:
-    | "Awaiting Uploads"
-    | "Reconciling"
-    | "Needs Review"
-    | "Statement Ready";
+  cycleStatus: CycleStatus;
   mismatchCount: number;
-  statementStatus: "Not Ready" | "Pending" | "Ready";
+  statementStatus: "NOT_READY" | "DRAFT" | "READY" | "FAILED";
 };
 
-type SharedDashboardState =
+type LpDashboardState =
   | {
       kind: "ready";
+      userName: string;
+      lpLabel: string;
       summary: DashboardSummary[];
       recentCycles: RecentCycleRow[];
     }
   | {
       kind: "empty";
+      userName: string;
+      lpLabel: string;
+      noWorkspaceAccess: boolean;
     }
   | {
       kind: "error";
+      userName: string;
       message: string;
-    }
-  | {
-      kind: "loading";
     };
+
+const ACTIVE_CYCLE_STATUSES: CycleStatus[] = [
+  "AWAITING_UPLOADS",
+  "PROCESSING",
+  "READY_FOR_RECONCILIATION",
+  "RECONCILING",
+  "MISMATCHES_FOUND",
+  "STATEMENT_PENDING",
+  "STATEMENT_GENERATING",
+];
+
+const LP_UPLOAD_ATTENTION_STATUSES: ImportBatchStatus[] = [
+  "RECEIVED",
+  "PREVALIDATION_FAILED",
+  "VALIDATING",
+  "VALIDATION_FAILED",
+  "WAITING_FOR_COUNTERPART",
+  "FAILED",
+  "CANCELED",
+];
+
+function formatMonth(date: Date) {
+  return new Intl.DateTimeFormat("en-US", {
+    month: "long",
+    year: "numeric",
+  }).format(date);
+}
 
 function getRoleLabel(role?: "USER" | "ADMIN" | "FINANCE_VIEWER") {
   if (role === "ADMIN") {
@@ -62,107 +96,41 @@ function getRoleLabel(role?: "USER" | "ADMIN" | "FINANCE_VIEWER") {
     return "Finance Viewer";
   }
 
-  return "Operations User";
+  return "LP Workspace";
 }
 
-function getRoleSubtitle(role?: "USER" | "ADMIN" | "FINANCE_VIEWER") {
-  if (role === "ADMIN") {
-    return "Here’s what needs attention across the platform today.";
+function getStatementTone(status: RecentCycleRow["statementStatus"]) {
+  if (status === "READY") {
+    return "border-emerald-400/30 bg-emerald-500/10 text-emerald-100";
   }
 
-  if (role === "FINANCE_VIEWER") {
-    return "Here’s the current finance-facing reconciliation and statement activity.";
+  if (status === "FAILED") {
+    return "border-red-400/30 bg-red-500/10 text-red-100";
   }
 
-  return "Here’s what needs attention today.";
+  if (status === "DRAFT") {
+    return "border-amber-400/30 bg-amber-500/10 text-amber-100";
+  }
+
+  return "border-white/10 bg-white/5 text-slate-200";
 }
 
-async function getSharedDashboardState(): Promise<SharedDashboardState> {
-  const mockMode = process.env.MOCK_SHARED_DASHBOARD_STATE;
-
-  if (mockMode === "loading") {
-    return { kind: "loading" };
+function mapStatementStatus(
+  status: StatementStatus | undefined,
+): RecentCycleRow["statementStatus"] {
+  if (status === "FINAL") {
+    return "READY";
   }
 
-  if (mockMode === "error") {
-    return {
-      kind: "error",
-      message:
-        "We could not load dashboard metrics right now. Try again shortly or contact VendorStream support if the issue persists.",
-    };
+  if (status === "FAILED") {
+    return "FAILED";
   }
 
-  if (mockMode === "empty") {
-    return { kind: "empty" };
+  if (status === "DRAFT") {
+    return "DRAFT";
   }
 
-  return {
-    kind: "ready",
-    summary: [
-      {
-        label: "Active Cycles",
-        value: "12",
-        detail: "Open reconciliation cycles across licensed producers and store locations.",
-        tone: "neutral",
-      },
-      {
-        label: "Pending Uploads",
-        value: "5",
-        detail: "Cycles still waiting on an LP or store source file before matching can proceed.",
-        tone: "warning",
-      },
-      {
-        label: "Open Mismatches",
-        value: "27",
-        detail: "Row-level issues currently blocking clean reconciliation or statement generation.",
-        tone: "warning",
-      },
-      {
-        label: "Ready Statements",
-        value: "9",
-        detail: "Generated statements available for downstream finance review and export.",
-        tone: "success",
-      },
-    ],
-    recentCycles: [
-      {
-        id: "cycle_apr_downtown",
-        month: "April 2026",
-        lpName: "Northstar Beverage Group",
-        storeLocation: "Toronto Downtown",
-        status: "Needs Review",
-        mismatchCount: 6,
-        statementStatus: "Pending",
-      },
-      {
-        id: "cycle_apr_waterfront",
-        month: "April 2026",
-        lpName: "Northstar Beverage Group",
-        storeLocation: "Toronto Waterfront",
-        status: "Reconciling",
-        mismatchCount: 2,
-        statementStatus: "Not Ready",
-      },
-      {
-        id: "cycle_mar_mississauga",
-        month: "March 2026",
-        lpName: "Northstar Beverage Group",
-        storeLocation: "Mississauga Central",
-        status: "Statement Ready",
-        mismatchCount: 0,
-        statementStatus: "Ready",
-      },
-      {
-        id: "cycle_jan_brampton",
-        month: "January 2026",
-        lpName: "Metro Beverage Partners",
-        storeLocation: "Brampton West",
-        status: "Awaiting Uploads",
-        mismatchCount: 0,
-        statementStatus: "Not Ready",
-      },
-    ],
-  };
+  return "NOT_READY";
 }
 
 function StatusPill({
@@ -246,60 +214,6 @@ function QuickActionCard({
   );
 }
 
-function LoadingState() {
-  return (
-    <div className="space-y-6">
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-        {[0, 1, 2, 3].map((item) => (
-          <Card
-            key={item}
-            className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl"
-          >
-            <CardHeader className="space-y-3">
-              <div className="h-3 w-28 animate-pulse rounded bg-white/10" />
-              <div className="h-10 w-20 animate-pulse rounded bg-white/10" />
-            </CardHeader>
-            <CardContent>
-              <div className="h-10 animate-pulse rounded-xl bg-white/8" />
-            </CardContent>
-          </Card>
-        ))}
-      </div>
-
-      <div className="grid gap-4 lg:grid-cols-[1.5fr_0.9fr]">
-        <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
-          <CardHeader className="space-y-3">
-            <div className="h-5 w-56 animate-pulse rounded bg-white/10" />
-            <div className="h-4 w-72 animate-pulse rounded bg-white/10" />
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {[0, 1, 2, 3].map((item) => (
-              <div
-                key={item}
-                className="h-20 animate-pulse rounded-2xl bg-white/8"
-              />
-            ))}
-          </CardContent>
-        </Card>
-
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-1">
-          {[0, 1, 2, 3].map((item) => (
-            <Card
-              key={item}
-              className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl"
-            >
-              <CardHeader className="space-y-3">
-                <div className="h-5 w-40 animate-pulse rounded bg-white/10" />
-                <div className="h-8 animate-pulse rounded bg-white/8" />
-              </CardHeader>
-            </Card>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-}
-
 function ErrorState({ message }: { message: string }) {
   return (
     <Card className="border border-red-400/20 bg-red-500/8 shadow-2xl backdrop-blur-xl">
@@ -308,7 +222,7 @@ function ErrorState({ message }: { message: string }) {
           Dashboard unavailable
         </div>
         <CardTitle className="text-2xl text-white">
-          Shared dashboard data could not be loaded
+          Dashboard data could not be loaded
         </CardTitle>
         <CardDescription className="text-sm leading-6 text-red-100/90">
           {message}
@@ -330,21 +244,27 @@ function ErrorState({ message }: { message: string }) {
   );
 }
 
-function EmptyState() {
+function EmptyState({
+  lpLabel,
+  noWorkspaceAccess,
+}: Extract<LpDashboardState, { kind: "empty" }>) {
   return (
     <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
       <CardHeader className="space-y-2">
         <CardTitle className="text-2xl text-white">
-          No operational activity yet
+          {noWorkspaceAccess
+            ? "No LP workspace access"
+            : "No LP activity yet"}
         </CardTitle>
         <CardDescription className="text-sm leading-6 text-slate-300">
-          As upload, reconciliation, and statement data is created, this dashboard
-          will surface the most important items that need attention.
+          {noWorkspaceAccess
+            ? "This account does not have an LP workspace assignment yet. If you expected LP access, ask a VendorStream admin to review your memberships."
+            : `As uploads, reconciliation cycles, and statements are created for ${lpLabel}, the most important operational items will appear here.`}
         </CardDescription>
       </CardHeader>
       <CardContent className="flex flex-wrap gap-3">
         <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
-          <Link href="/lp/uploads/new">Upload monthly file</Link>
+          <Link href="/lp/uploads">Open upload history</Link>
         </Button>
         <Button
           asChild
@@ -358,6 +278,213 @@ function EmptyState() {
   );
 }
 
+async function getDashboardState(): Promise<LpDashboardState> {
+  const session = await getServerSession(authOptions);
+
+  if (!session?.user) {
+    redirect("/login");
+  }
+
+  if (!session.user.id) {
+    redirect("/login");
+  }
+
+  const userName = session.user.name?.trim() || "VendorStream User";
+
+  if (session.user.systemRole === "ADMIN") {
+    redirect("/admin/dashboard");
+  }
+
+  try {
+    const [lpContext, storeContext] = await Promise.all([
+      getLpAccessContextForUser({
+        userId: session.user.id,
+        systemRole: session.user.systemRole,
+      }),
+      getStoreUploadContextForUser({
+        userId: session.user.id,
+        systemRole: session.user.systemRole,
+      }),
+    ]);
+
+    if (lpContext.lpIds.length === 0) {
+      if (storeContext.options.length > 0) {
+        redirect("/store/dashboard");
+      }
+
+      return {
+        kind: "empty",
+        userName,
+        lpLabel: "LP workspace",
+        noWorkspaceAccess: true,
+      };
+    }
+
+    const [activeCycles, pendingUploads, openMismatches, readyStatements, recentCycles] =
+      await Promise.all([
+        prisma.reconciliationCycle.count({
+          where: {
+            lpId: {
+              in: lpContext.lpIds,
+            },
+            status: {
+              in: ACTIVE_CYCLE_STATUSES,
+            },
+          },
+        }),
+        prisma.reconciliationCycle.count({
+          where: {
+            lpId: {
+              in: lpContext.lpIds,
+            },
+            OR: [
+              {
+                status: "AWAITING_UPLOADS",
+              },
+              {
+                importBatches: {
+                  none: {
+                    sourceType: "LP",
+                    isCurrent: true,
+                  },
+                },
+              },
+              {
+                importBatches: {
+                  some: {
+                    sourceType: "LP",
+                    isCurrent: true,
+                    status: {
+                      in: LP_UPLOAD_ATTENTION_STATUSES,
+                    },
+                  },
+                },
+              },
+            ],
+          },
+        }),
+        prisma.mismatch.count({
+          where: {
+            cycle: {
+              lpId: {
+                in: lpContext.lpIds,
+              },
+            },
+            status: "OPEN",
+          },
+        }),
+        prisma.statement.count({
+          where: {
+            cycle: {
+              lpId: {
+                in: lpContext.lpIds,
+              },
+            },
+            status: "FINAL",
+          },
+        }),
+        prisma.reconciliationCycle.findMany({
+          where: {
+            lpId: {
+              in: lpContext.lpIds,
+            },
+          },
+          orderBy: [{ updatedAt: "desc" }, { periodMonth: "desc" }],
+          take: 6,
+          select: {
+            id: true,
+            periodMonth: true,
+            status: true,
+            lp: {
+              select: {
+                name: true,
+              },
+            },
+            storeLocation: {
+              select: {
+                name: true,
+              },
+            },
+            mismatches: {
+              where: {
+                status: "OPEN",
+              },
+              select: {
+                id: true,
+              },
+            },
+            statements: {
+              orderBy: [{ version: "desc" }, { createdAt: "desc" }],
+              take: 1,
+              select: {
+                status: true,
+              },
+            },
+          },
+        }),
+      ]);
+
+    if (recentCycles.length === 0) {
+      return {
+        kind: "empty",
+        userName,
+        lpLabel: lpContext.displayName,
+        noWorkspaceAccess: false,
+      };
+    }
+
+    return {
+      kind: "ready",
+      userName,
+      lpLabel: lpContext.displayName,
+      summary: [
+        {
+          label: "Active Cycles",
+          value: String(activeCycles),
+          detail: "Open reconciliation cycles currently progressing through upload, matching, or statement preparation.",
+          tone: "neutral",
+        },
+        {
+          label: "Pending Uploads",
+          value: String(pendingUploads),
+          detail: "Cycles still waiting on an LP upload or needing LP-side upload attention before reconciliation can progress.",
+          tone: "warning",
+        },
+        {
+          label: "Open Mismatches",
+          value: String(openMismatches),
+          detail: "Outstanding row-level issues still requiring review before downstream finance work is complete.",
+          tone: "warning",
+        },
+        {
+          label: "Ready Statements",
+          value: String(readyStatements),
+          detail: "Finalized statement versions currently available across the accessible LP workspace.",
+          tone: "success",
+        },
+      ],
+      recentCycles: recentCycles.map((cycle) => ({
+        id: cycle.id,
+        monthLabel: formatMonth(cycle.periodMonth),
+        lpName: cycle.lp.name,
+        storeLocation: cycle.storeLocation.name,
+        cycleStatus: cycle.status,
+        mismatchCount: cycle.mismatches.length,
+        statementStatus: mapStatementStatus(cycle.statements[0]?.status),
+      })),
+    };
+  } catch (error) {
+    console.error("Failed to load shared dashboard", error);
+
+    return {
+      kind: "error",
+      userName,
+      message:
+        "We could not load dashboard metrics right now. Try again shortly or contact VendorStream support if the issue persists.",
+    };
+  }
+}
+
 export default async function DashboardPage() {
   const session = await getServerSession(authOptions);
 
@@ -365,10 +492,8 @@ export default async function DashboardPage() {
     redirect("/login");
   }
 
-  const state = await getSharedDashboardState();
-  const userName = session.user.name?.trim() || "VendorStream User";
+  const state = await getDashboardState();
   const roleLabel = getRoleLabel(session.user.systemRole);
-  const subtitle = getRoleSubtitle(session.user.systemRole);
 
   return (
     <main className="relative min-h-screen overflow-hidden text-white">
@@ -379,25 +504,30 @@ export default async function DashboardPage() {
               Dashboard
             </div>
             <StatusPill label={roleLabel} tone="neutral" />
+            {state.kind !== "error" ? (
+              <StatusPill label={state.lpLabel} tone="success" />
+            ) : null}
           </div>
           <div className="space-y-2">
             <h1 className="text-4xl font-semibold tracking-tight text-white sm:text-5xl">
-              Welcome back, {userName}
+              Welcome back, {state.userName}
             </h1>
             <p className="max-w-3xl text-sm leading-7 text-slate-300 sm:text-base">
-              {subtitle}
+              Review live LP reconciliation activity, upload attention, and
+              statement readiness across your VendorStream workspace.
             </p>
-          </div>
-          <div className="rounded-2xl border border-cyan-400/20 bg-cyan-400/10 px-4 py-4 text-sm leading-6 text-cyan-100">
-            Shared dashboard mode is active. TODO: branch summary cards, quick
-            actions, and recent activity by authenticated user role and current
-            organization context.
           </div>
         </header>
 
-        {state.kind === "loading" ? <LoadingState /> : null}
         {state.kind === "error" ? <ErrorState message={state.message} /> : null}
-        {state.kind === "empty" ? <EmptyState /> : null}
+        {state.kind === "empty" ? (
+          <EmptyState
+            kind="empty"
+            userName={state.userName}
+            lpLabel={state.lpLabel}
+            noWorkspaceAccess={state.noWorkspaceAccess}
+          />
+        ) : null}
         {state.kind === "ready" ? (
           <div className="space-y-6">
             <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
@@ -413,7 +543,8 @@ export default async function DashboardPage() {
                     Recent reconciliation cycles
                   </CardTitle>
                   <CardDescription className="text-sm leading-6 text-slate-300">
-                    Recent activity across LP and store reconciliation work.
+                    Recent LP-scoped cycle activity across the workspaces you can
+                    access.
                   </CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-3">
@@ -422,13 +553,13 @@ export default async function DashboardPage() {
                       key={cycle.id}
                       className="rounded-2xl border border-white/8 bg-slate-950/35 px-4 py-4"
                     >
-                      <div className="grid gap-4 xl:grid-cols-[0.8fr_1fr_1fr_0.9fr_0.7fr_0.8fr] xl:items-center">
+                      <div className="grid gap-4 xl:grid-cols-[0.8fr_1fr_1fr_1fr_0.7fr_0.8fr_auto] xl:items-center">
                         <div className="space-y-1">
                           <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
                             Month
                           </div>
                           <div className="text-sm font-medium text-white">
-                            {cycle.month}
+                            {cycle.monthLabel}
                           </div>
                         </div>
 
@@ -452,15 +583,18 @@ export default async function DashboardPage() {
 
                         <div className="space-y-1">
                           <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
-                            Status
+                            Cycle status
                           </div>
                           <StatusPill
-                            label={cycle.status}
+                            label={cycle.cycleStatus.replaceAll("_", " ")}
                             tone={
-                              cycle.status === "Statement Ready"
+                              cycle.cycleStatus === "STATEMENT_READY" ||
+                              cycle.cycleStatus === "RECONCILIATION_PASSED"
                                 ? "success"
-                                : cycle.status === "Needs Review" ||
-                                    cycle.status === "Awaiting Uploads"
+                                : cycle.cycleStatus === "MISMATCHES_FOUND" ||
+                                    cycle.cycleStatus === "AWAITING_UPLOADS" ||
+                                    cycle.cycleStatus === "STATEMENT_PENDING" ||
+                                    cycle.cycleStatus === "STATEMENT_GENERATING"
                                   ? "warning"
                                   : "neutral"
                             }
@@ -480,16 +614,22 @@ export default async function DashboardPage() {
                           <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
                             Statement
                           </div>
-                          <StatusPill
-                            label={cycle.statementStatus}
-                            tone={
-                              cycle.statementStatus === "Ready"
-                                ? "success"
-                                : cycle.statementStatus === "Pending"
-                                  ? "warning"
-                                  : "neutral"
-                            }
-                          />
+                          <span
+                            className={`inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-medium ${getStatementTone(cycle.statementStatus)}`}
+                          >
+                            {cycle.statementStatus.replaceAll("_", " ")}
+                          </span>
+                        </div>
+
+                        <div className="flex flex-wrap gap-2 xl:justify-end">
+                          <Button
+                            asChild
+                            size="sm"
+                            variant="outline"
+                            className="border-white/15 bg-white/5 text-white hover:bg-white/10"
+                          >
+                            <Link href={`/lp/cycles/${cycle.id}`}>View cycle</Link>
+                          </Button>
                         </div>
                       </div>
                     </div>
@@ -500,7 +640,7 @@ export default async function DashboardPage() {
               <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-1">
                 <QuickActionCard
                   title="Upload Monthly File"
-                  description="Create a new LP monthly upload and start the next reconciliation cycle."
+                  description="Start the next reconciliation cycle with a new LP source upload."
                   href="/lp/uploads/new"
                 />
                 <QuickActionCard
@@ -509,9 +649,9 @@ export default async function DashboardPage() {
                   href="/lp/uploads"
                 />
                 <QuickActionCard
-                  title="Review Mismatches"
-                  description="Open cycles that still require mismatch review or manual intervention."
-                  href="/lp/cycles?status=MISMATCHES_FOUND"
+                  title="Review Cycles"
+                  description="Open LP reconciliation cycles and focus on records that still need attention."
+                  href="/lp/cycles"
                 />
                 <QuickActionCard
                   title="View Statements"

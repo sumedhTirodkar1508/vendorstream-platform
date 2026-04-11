@@ -1,4 +1,9 @@
 import Link from "next/link";
+import { getServerSession } from "next-auth";
+import { redirect } from "next/navigation";
+import { prisma, type ImportBatchStatus } from "@vendorstream/database";
+import { authOptions } from "@/app/api/auth/[...nextauth]/options";
+import { getLpAccessContextForUser } from "@/lib/lp-access-context";
 import {
   Card,
   CardContent,
@@ -8,103 +13,56 @@ import {
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 
-type ImportBatchStatus =
-  | "RECEIVED"
-  | "VALIDATING"
-  | "VALIDATION_FAILED"
-  | "WAITING_FOR_COUNTERPART"
-  | "RECONCILING"
-  | "RECONCILED"
-  | "FAILED";
-
 type ImportHistoryRow = {
   id: string;
-  month: string;
+  month: Date;
   uploadedFileName: string;
-  uploadedAt: string;
+  uploadedAt: Date;
   uploadedBy: string;
   sourceType: "LP";
   status: ImportBatchStatus;
-  totalRows: number;
-  validRows: number;
-  invalidRows: number;
+  totalRows: number | null;
+  validRows: number | null;
+  invalidRows: number | null;
+};
+
+type ImportHistoryFilters = {
+  month: string;
+  status: string;
 };
 
 type ImportHistoryState =
   | {
       kind: "ready";
       lpName: string;
-      filters: {
-        month: string;
-        status: string;
-      };
+      filters: ImportHistoryFilters;
       rows: ImportHistoryRow[];
+      isAdminPreview: boolean;
     }
   | {
       kind: "empty";
       lpName: string;
-      filters: {
-        month: string;
-        status: string;
-      };
+      filters: ImportHistoryFilters;
+      isAdminPreview: boolean;
+      isAccessEmpty: boolean;
     }
   | {
       kind: "error";
       message: string;
-    }
-  | {
-      kind: "loading";
     };
 
-const mockRows: ImportHistoryRow[] = [
-  {
-    id: "batch_apr_2026",
-    month: "2026-04",
-    uploadedFileName: "northstar_lp_apr_2026.xlsx",
-    uploadedAt: "Apr 8, 2026 09:14 AM",
-    uploadedBy: "Avery Chen",
-    sourceType: "LP",
-    status: "WAITING_FOR_COUNTERPART",
-    totalRows: 412,
-    validRows: 405,
-    invalidRows: 7,
-  },
-  {
-    id: "batch_mar_2026",
-    month: "2026-03",
-    uploadedFileName: "northstar_lp_mar_2026.xlsx",
-    uploadedAt: "Apr 2, 2026 03:41 PM",
-    uploadedBy: "Avery Chen",
-    sourceType: "LP",
-    status: "RECONCILED",
-    totalRows: 398,
-    validRows: 398,
-    invalidRows: 0,
-  },
-  {
-    id: "batch_feb_2026",
-    month: "2026-02",
-    uploadedFileName: "northstar_lp_feb_2026_v2.xlsx",
-    uploadedAt: "Mar 7, 2026 11:22 AM",
-    uploadedBy: "Jordan Patel",
-    sourceType: "LP",
-    status: "RECONCILING",
-    totalRows: 387,
-    validRows: 384,
-    invalidRows: 3,
-  },
-  {
-    id: "batch_jan_2026",
-    month: "2026-01",
-    uploadedFileName: "northstar_lp_jan_2026.xlsx",
-    uploadedAt: "Feb 4, 2026 08:03 AM",
-    uploadedBy: "Jordan Patel",
-    sourceType: "LP",
-    status: "VALIDATION_FAILED",
-    totalRows: 401,
-    validRows: 372,
-    invalidRows: 29,
-  },
+const STATUS_OPTIONS: ImportBatchStatus[] = [
+  "RECEIVED",
+  "PREVALIDATION_FAILED",
+  "VALIDATING",
+  "VALIDATION_FAILED",
+  "STAGED",
+  "WAITING_FOR_COUNTERPART",
+  "READY_FOR_RECONCILIATION",
+  "RECONCILING",
+  "RECONCILED",
+  "FAILED",
+  "CANCELED",
 ];
 
 function getStatusTone(status: ImportBatchStatus) {
@@ -112,73 +70,202 @@ function getStatusTone(status: ImportBatchStatus) {
     return "border-emerald-400/30 bg-emerald-500/10 text-emerald-100";
   }
 
-  if (status === "VALIDATION_FAILED" || status === "FAILED") {
+  if (
+    status === "PREVALIDATION_FAILED" ||
+    status === "VALIDATION_FAILED" ||
+    status === "FAILED" ||
+    status === "CANCELED"
+  ) {
     return "border-red-400/30 bg-red-500/10 text-red-100";
   }
 
-  if (status === "WAITING_FOR_COUNTERPART") {
+  if (
+    status === "RECEIVED" ||
+    status === "VALIDATING" ||
+    status === "WAITING_FOR_COUNTERPART"
+  ) {
     return "border-amber-400/30 bg-amber-500/10 text-amber-100";
   }
 
   return "border-white/10 bg-white/5 text-slate-200";
 }
 
-function formatMonthLabel(value: string) {
-  const [year, month] = value.split("-");
-  const parsedDate = new Date(Number(year), Number(month) - 1, 1);
-
+function formatMonthLabel(value: Date) {
   return new Intl.DateTimeFormat("en-US", {
     month: "long",
     year: "numeric",
-  }).format(parsedDate);
+  }).format(value);
+}
+
+function formatDateTime(value: Date | null) {
+  if (!value) {
+    return "Not available";
+  }
+
+  return new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(value);
+}
+
+function parseMonthFilter(value: string) {
+  if (!/^\d{4}-\d{2}$/.test(value)) {
+    return null;
+  }
+
+  const [year, month] = value.split("-").map((part) => Number(part));
+  const start = new Date(Date.UTC(year, month - 1, 1, 0, 0, 0, 0));
+  const end = new Date(Date.UTC(year, month, 1, 0, 0, 0, 0));
+
+  return { start, end };
 }
 
 async function getLpImportHistoryState(searchParams?: {
   month?: string;
   status?: string;
 }): Promise<ImportHistoryState> {
-  const mockMode = process.env.MOCK_LP_IMPORT_HISTORY_STATE;
-  const monthFilter = searchParams?.month?.trim() ?? "";
-  const statusFilter = searchParams?.status?.trim() ?? "";
+  const session = await getServerSession(authOptions);
 
-  if (mockMode === "loading") {
-    return { kind: "loading" };
+  if (!session?.user) {
+    redirect("/login");
   }
 
-  if (mockMode === "error") {
+  if (!session.user.id) {
+    redirect("/login");
+  }
+
+  const filters: ImportHistoryFilters = {
+    month: searchParams?.month?.trim() ?? "",
+    status: searchParams?.status?.trim() ?? "",
+  };
+
+  try {
+    const context = await getLpAccessContextForUser({
+      userId: session.user.id,
+      systemRole: session.user.systemRole,
+    });
+
+    if (context.lpIds.length === 0) {
+      return {
+        kind: "empty",
+        lpName: context.displayName,
+        filters,
+        isAdminPreview: false,
+        isAccessEmpty: true,
+      };
+    }
+
+    const monthRange = parseMonthFilter(filters.month);
+    const statusFilter = STATUS_OPTIONS.includes(filters.status as ImportBatchStatus)
+      ? (filters.status as ImportBatchStatus)
+      : undefined;
+
+    const where = {
+      sourceType: "LP" as const,
+      cycle: {
+        lpId: {
+          in: context.lpIds,
+        },
+        ...(monthRange
+          ? {
+              periodMonth: {
+                gte: monthRange.start,
+                lt: monthRange.end,
+              },
+            }
+          : {}),
+      },
+      ...(statusFilter ? { status: statusFilter } : {}),
+    };
+
+    const rows = await prisma.importBatch.findMany({
+      where,
+      orderBy: [{ cycle: { periodMonth: "desc" } }, { createdAt: "desc" }],
+      take: 100,
+      select: {
+        id: true,
+        sourceType: true,
+        status: true,
+        totalRowCount: true,
+        validRowCount: true,
+        invalidRowCount: true,
+        uploadedBy: {
+          select: {
+            name: true,
+            email: true,
+          },
+        },
+        uploadedFile: {
+          select: {
+            originalFilename: true,
+            uploadedAt: true,
+          },
+        },
+        cycle: {
+          select: {
+            periodMonth: true,
+          },
+        },
+        _count: {
+          select: {
+            rawLpRows: true,
+            normalizedLpRows: true,
+          },
+        },
+      },
+    });
+
+    if (rows.length === 0) {
+      return {
+        kind: "empty",
+        lpName: context.displayName,
+        filters,
+        isAdminPreview: context.isFallbackContext,
+        isAccessEmpty: false,
+      };
+    }
+
+    return {
+      kind: "ready",
+      lpName: context.displayName,
+      filters,
+      isAdminPreview: context.isFallbackContext,
+      rows: rows.map((row) => {
+        const totalRows = row.totalRowCount ?? row._count.rawLpRows;
+        const validRows = row.validRowCount ?? row._count.normalizedLpRows;
+        const invalidRows =
+          row.invalidRowCount ??
+          (totalRows !== null && validRows !== null
+            ? Math.max(totalRows - validRows, 0)
+            : null);
+
+        return {
+          id: row.id,
+          month: row.cycle.periodMonth,
+          uploadedFileName: row.uploadedFile.originalFilename,
+          uploadedAt: row.uploadedFile.uploadedAt,
+          uploadedBy:
+            row.uploadedBy?.name ?? row.uploadedBy?.email ?? "VendorStream User",
+          sourceType: "LP",
+          status: row.status,
+          totalRows,
+          validRows,
+          invalidRows,
+        };
+      }),
+    };
+  } catch (error) {
+    console.error("Failed to load LP import history", error);
+
     return {
       kind: "error",
       message:
         "We could not load LP import history right now. Try again shortly or contact VendorStream support if the issue persists.",
     };
   }
-
-  const filteredRows = mockRows.filter((row) => {
-    const monthMatch = !monthFilter || row.month === monthFilter;
-    const statusMatch = !statusFilter || row.status === statusFilter;
-    return monthMatch && statusMatch;
-  });
-
-  if (mockMode === "empty" || filteredRows.length === 0) {
-    return {
-      kind: "empty",
-      lpName: "Northstar Beverage Group",
-      filters: {
-        month: monthFilter,
-        status: statusFilter,
-      },
-    };
-  }
-
-  return {
-    kind: "ready",
-    lpName: "Northstar Beverage Group",
-    filters: {
-      month: monthFilter,
-      status: statusFilter,
-    },
-    rows: filteredRows,
-  };
 }
 
 function StatusBadge({ status }: { status: ImportBatchStatus }) {
@@ -194,10 +281,7 @@ function StatusBadge({ status }: { status: ImportBatchStatus }) {
 function FilterForm({
   filters,
 }: {
-  filters: {
-    month: string;
-    status: string;
-  };
+  filters: ImportHistoryFilters;
 }) {
   return (
     <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
@@ -241,15 +325,7 @@ function FilterForm({
               <option value="" className="bg-slate-950 text-white">
                 All statuses
               </option>
-              {[
-                "RECEIVED",
-                "VALIDATING",
-                "VALIDATION_FAILED",
-                "WAITING_FOR_COUNTERPART",
-                "RECONCILING",
-                "RECONCILED",
-                "FAILED",
-              ].map((status) => (
+              {STATUS_OPTIONS.map((status) => (
                 <option
                   key={status}
                   value={status}
@@ -283,34 +359,6 @@ function FilterForm({
   );
 }
 
-function LoadingState() {
-  return (
-    <div className="space-y-6">
-      <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
-        <CardHeader className="space-y-3">
-          <div className="h-6 w-32 animate-pulse rounded bg-white/10" />
-          <div className="h-10 animate-pulse rounded-xl bg-white/8" />
-        </CardHeader>
-      </Card>
-
-      <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
-        <CardHeader className="space-y-3">
-          <div className="h-5 w-52 animate-pulse rounded bg-white/10" />
-          <div className="h-4 w-72 animate-pulse rounded bg-white/10" />
-        </CardHeader>
-        <CardContent className="space-y-3">
-          {[0, 1, 2, 3].map((item) => (
-            <div
-              key={item}
-              className="h-20 animate-pulse rounded-2xl bg-white/8"
-            />
-          ))}
-        </CardContent>
-      </Card>
-    </div>
-  );
-}
-
 function ErrorState({ message }: { message: string }) {
   return (
     <Card className="border border-red-400/20 bg-red-500/8 shadow-2xl backdrop-blur-xl">
@@ -326,10 +374,7 @@ function ErrorState({ message }: { message: string }) {
         </CardDescription>
       </CardHeader>
       <CardContent className="flex flex-wrap gap-3">
-        <Button
-          asChild
-          className="bg-white text-slate-950 hover:bg-slate-100"
-        >
+        <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
           <Link href="/dashboard">Return to dashboard</Link>
         </Button>
         <Button
@@ -347,12 +392,13 @@ function ErrorState({ message }: { message: string }) {
 function EmptyState({
   lpName,
   filters,
+  isAdminPreview,
+  isAccessEmpty,
 }: {
   lpName: string;
-  filters: {
-    month: string;
-    status: string;
-  };
+  filters: ImportHistoryFilters;
+  isAdminPreview: boolean;
+  isAccessEmpty: boolean;
 }) {
   const hasFilters = Boolean(filters.month || filters.status);
 
@@ -360,15 +406,24 @@ function EmptyState({
     <div className="space-y-6">
       <FilterForm filters={filters} />
 
+      {isAdminPreview ? (
+        <div className="rounded-2xl border border-amber-400/20 bg-amber-500/10 px-4 py-4 text-sm leading-6 text-amber-100">
+          Admin preview is showing LP upload activity across active LP
+          workspaces because no explicit LP membership is attached to this user.
+        </div>
+      ) : null}
+
       <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
         <CardHeader className="space-y-2">
           <CardTitle className="text-2xl text-white">
             No import batches found
           </CardTitle>
           <CardDescription className="text-sm leading-6 text-slate-300">
-            {hasFilters
-              ? "No LP upload batches match the current filters."
-              : `There are no LP import batches yet for ${lpName}.`}
+            {isAccessEmpty
+              ? "This account is not assigned to any LP workspace yet."
+              : hasFilters
+                ? "No LP upload batches match the current filters."
+                : `There are no LP import batches yet for ${lpName}.`}
           </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-wrap gap-3">
@@ -401,6 +456,13 @@ function ReadyState({
   return (
     <div className="space-y-6">
       <FilterForm filters={state.filters} />
+
+      {state.isAdminPreview ? (
+        <div className="rounded-2xl border border-amber-400/20 bg-amber-500/10 px-4 py-4 text-sm leading-6 text-amber-100">
+          Admin preview is showing LP upload activity across active LP
+          workspaces because no explicit LP membership is attached to this user.
+        </div>
+      ) : null}
 
       <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
         <CardHeader className="space-y-2">
@@ -441,7 +503,9 @@ function ReadyState({
                   <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
                     Uploaded at
                   </div>
-                  <div className="text-sm text-slate-300">{row.uploadedAt}</div>
+                  <div className="text-sm text-slate-300">
+                    {formatDateTime(row.uploadedAt)}
+                  </div>
                 </div>
 
                 <div className="space-y-1">
@@ -469,21 +533,27 @@ function ReadyState({
                   <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
                     Total rows
                   </div>
-                  <div className="text-sm text-slate-300">{row.totalRows}</div>
+                  <div className="text-sm text-slate-300">
+                    {row.totalRows ?? "N/A"}
+                  </div>
                 </div>
 
                 <div className="space-y-1">
                   <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
                     Valid rows
                   </div>
-                  <div className="text-sm text-emerald-200">{row.validRows}</div>
+                  <div className="text-sm text-emerald-200">
+                    {row.validRows ?? "N/A"}
+                  </div>
                 </div>
 
                 <div className="space-y-1">
                   <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
                     Invalid rows
                   </div>
-                  <div className="text-sm text-red-200">{row.invalidRows}</div>
+                  <div className="text-sm text-red-200">
+                    {row.invalidRows ?? "N/A"}
+                  </div>
                 </div>
 
                 <div className="flex flex-wrap gap-2 xl:justify-end">
@@ -500,6 +570,7 @@ function ReadyState({
                     size="sm"
                     variant="ghost"
                     className="text-slate-300 hover:bg-white/5 hover:text-white"
+                    disabled
                   >
                     Reprocess
                   </Button>
@@ -549,10 +620,14 @@ export default async function LpImportHistoryPage({
           </div>
         </header>
 
-        {state.kind === "loading" ? <LoadingState /> : null}
         {state.kind === "error" ? <ErrorState message={state.message} /> : null}
         {state.kind === "empty" ? (
-          <EmptyState lpName={state.lpName} filters={state.filters} />
+          <EmptyState
+            lpName={state.lpName}
+            filters={state.filters}
+            isAdminPreview={state.isAdminPreview}
+            isAccessEmpty={state.isAccessEmpty}
+          />
         ) : null}
         {state.kind === "ready" ? <ReadyState state={state} /> : null}
       </div>

@@ -1,4 +1,14 @@
 import Link from "next/link";
+import { getServerSession } from "next-auth";
+import { redirect } from "next/navigation";
+import {
+  prisma,
+  type CycleStatus,
+  type ImportBatchStatus,
+  type StatementStatus,
+} from "@vendorstream/database";
+import { authOptions } from "@/app/api/auth/[...nextauth]/options";
+import { getLpAccessContextForUser } from "@/lib/lp-access-context";
 import {
   Card,
   CardContent,
@@ -8,25 +18,14 @@ import {
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 
-type CycleStatus =
-  | "AWAITING_UPLOADS"
-  | "PROCESSING"
-  | "READY_FOR_RECONCILIATION"
-  | "RECONCILING"
-  | "MISMATCHES_FOUND"
-  | "RECONCILIATION_PASSED"
-  | "STATEMENT_PENDING"
-  | "STATEMENT_GENERATING"
-  | "STATEMENT_READY"
-  | "FAILED";
-
 type UploadState = "NOT_UPLOADED" | "UPLOADED" | "VALIDATING" | "FAILED";
 type StatementState = "NOT_READY" | "PENDING" | "GENERATING" | "READY" | "FAILED";
 
 type CycleRow = {
   id: string;
-  month: string;
+  month: Date;
   storeOrganization: string;
+  storeLocationId: string;
   storeLocation: string;
   cycleStatus: CycleStatus;
   lpUploadStatus: UploadState;
@@ -35,102 +34,58 @@ type CycleRow = {
   statementStatus: StatementState;
 };
 
+type CycleFilters = {
+  month: string;
+  status: string;
+  storeLocation: string;
+};
+
 type CyclesState =
   | {
       kind: "ready";
       lpName: string;
-      filters: {
-        month: string;
-        status: string;
-        storeLocation: string;
-      };
+      filters: CycleFilters;
       rows: CycleRow[];
-      availableStoreLocations: string[];
+      availableStoreLocations: Array<{
+        id: string;
+        label: string;
+      }>;
+      isAdminPreview: boolean;
     }
   | {
       kind: "empty";
       lpName: string;
-      filters: {
-        month: string;
-        status: string;
-        storeLocation: string;
-      };
-      availableStoreLocations: string[];
+      filters: CycleFilters;
+      availableStoreLocations: Array<{
+        id: string;
+        label: string;
+      }>;
+      isAdminPreview: boolean;
+      isAccessEmpty: boolean;
     }
   | {
       kind: "error";
       message: string;
-    }
-  | {
-      kind: "loading";
     };
 
-const mockRows: CycleRow[] = [
-  {
-    id: "cycle_apr_downtown",
-    month: "2026-04",
-    storeOrganization: "Maple Retail Group",
-    storeLocation: "Toronto Downtown",
-    cycleStatus: "MISMATCHES_FOUND",
-    lpUploadStatus: "UPLOADED",
-    storeUploadStatus: "UPLOADED",
-    mismatchCount: 6,
-    statementStatus: "PENDING",
-  },
-  {
-    id: "cycle_apr_waterfront",
-    month: "2026-04",
-    storeOrganization: "Maple Retail Group",
-    storeLocation: "Toronto Waterfront",
-    cycleStatus: "READY_FOR_RECONCILIATION",
-    lpUploadStatus: "UPLOADED",
-    storeUploadStatus: "VALIDATING",
-    mismatchCount: 0,
-    statementStatus: "NOT_READY",
-  },
-  {
-    id: "cycle_mar_mississauga",
-    month: "2026-03",
-    storeOrganization: "Summit Stores",
-    storeLocation: "Mississauga Central",
-    cycleStatus: "STATEMENT_READY",
-    lpUploadStatus: "UPLOADED",
-    storeUploadStatus: "UPLOADED",
-    mismatchCount: 0,
-    statementStatus: "READY",
-  },
-  {
-    id: "cycle_feb_northyork",
-    month: "2026-02",
-    storeOrganization: "Summit Stores",
-    storeLocation: "North York East",
-    cycleStatus: "RECONCILING",
-    lpUploadStatus: "UPLOADED",
-    storeUploadStatus: "UPLOADED",
-    mismatchCount: 2,
-    statementStatus: "GENERATING",
-  },
-  {
-    id: "cycle_jan_brampton",
-    month: "2026-01",
-    storeOrganization: "Metro Beverage Partners",
-    storeLocation: "Brampton West",
-    cycleStatus: "AWAITING_UPLOADS",
-    lpUploadStatus: "NOT_UPLOADED",
-    storeUploadStatus: "UPLOADED",
-    mismatchCount: 0,
-    statementStatus: "NOT_READY",
-  },
+const STATUS_OPTIONS: CycleStatus[] = [
+  "AWAITING_UPLOADS",
+  "PROCESSING",
+  "READY_FOR_RECONCILIATION",
+  "RECONCILING",
+  "MISMATCHES_FOUND",
+  "RECONCILIATION_PASSED",
+  "STATEMENT_PENDING",
+  "STATEMENT_GENERATING",
+  "STATEMENT_READY",
+  "FAILED",
 ];
 
-function formatMonthLabel(value: string) {
-  const [year, month] = value.split("-");
-  const parsedDate = new Date(Number(year), Number(month) - 1, 1);
-
+function formatMonthLabel(value: Date) {
   return new Intl.DateTimeFormat("en-US", {
     month: "long",
     year: "numeric",
-  }).format(parsedDate);
+  }).format(value);
 }
 
 function getCycleStatusTone(status: CycleStatus) {
@@ -181,65 +136,242 @@ function getStatementStatusTone(status: StatementState) {
   return "border-white/10 bg-white/5 text-slate-200";
 }
 
+function parseMonthFilter(value: string) {
+  if (!/^\d{4}-\d{2}$/.test(value)) {
+    return null;
+  }
+
+  const [year, month] = value.split("-").map((part) => Number(part));
+  const start = new Date(Date.UTC(year, month - 1, 1, 0, 0, 0, 0));
+  const end = new Date(Date.UTC(year, month, 1, 0, 0, 0, 0));
+
+  return { start, end };
+}
+
+function mapUploadStatus(status?: ImportBatchStatus): UploadState {
+  if (!status) {
+    return "NOT_UPLOADED";
+  }
+
+  if (
+    status === "FAILED" ||
+    status === "PREVALIDATION_FAILED" ||
+    status === "VALIDATION_FAILED" ||
+    status === "CANCELED"
+  ) {
+    return "FAILED";
+  }
+
+  if (status === "RECEIVED" || status === "VALIDATING") {
+    return "VALIDATING";
+  }
+
+  return "UPLOADED";
+}
+
+function mapStatementStatus(args: {
+  cycleStatus: CycleStatus;
+  latestStatementStatus?: StatementStatus;
+}): StatementState {
+  if (args.latestStatementStatus === "FINAL" || args.cycleStatus === "STATEMENT_READY") {
+    return "READY";
+  }
+
+  if (args.latestStatementStatus === "FAILED") {
+    return "FAILED";
+  }
+
+  if (args.cycleStatus === "STATEMENT_GENERATING") {
+    return "GENERATING";
+  }
+
+  if (args.latestStatementStatus === "DRAFT" || args.cycleStatus === "STATEMENT_PENDING") {
+    return "PENDING";
+  }
+
+  return "NOT_READY";
+}
+
 async function getLpCyclesState(searchParams?: {
   month?: string;
   status?: string;
   storeLocation?: string;
 }): Promise<CyclesState> {
-  const mockMode = process.env.MOCK_LP_CYCLES_STATE;
-  const monthFilter = searchParams?.month?.trim() ?? "";
-  const statusFilter = searchParams?.status?.trim() ?? "";
-  const storeLocationFilter = searchParams?.storeLocation?.trim() ?? "";
+  const session = await getServerSession(authOptions);
 
-  if (mockMode === "loading") {
-    return { kind: "loading" };
+  if (!session?.user) {
+    redirect("/login");
   }
 
-  if (mockMode === "error") {
+  if (!session.user.id) {
+    redirect("/login");
+  }
+
+  const filters: CycleFilters = {
+    month: searchParams?.month?.trim() ?? "",
+    status: searchParams?.status?.trim() ?? "",
+    storeLocation: searchParams?.storeLocation?.trim() ?? "",
+  };
+
+  try {
+    const context = await getLpAccessContextForUser({
+      userId: session.user.id,
+      systemRole: session.user.systemRole,
+    });
+
+    if (context.lpIds.length === 0) {
+      return {
+        kind: "empty",
+        lpName: context.displayName,
+        filters,
+        availableStoreLocations: [],
+        isAdminPreview: false,
+        isAccessEmpty: true,
+      };
+    }
+
+    const monthRange = parseMonthFilter(filters.month);
+    const statusFilter = STATUS_OPTIONS.includes(filters.status as CycleStatus)
+      ? (filters.status as CycleStatus)
+      : undefined;
+
+    const [storeLocations, rows] = await Promise.all([
+      prisma.storeLocation.findMany({
+        where: {
+          lpAssignments: {
+            some: {
+              lpId: {
+                in: context.lpIds,
+              },
+              isActive: true,
+            },
+          },
+        },
+        select: {
+          id: true,
+          name: true,
+          storeOrganization: {
+            select: {
+              name: true,
+            },
+          },
+        },
+        orderBy: [{ storeOrganization: { name: "asc" } }, { name: "asc" }],
+      }),
+      prisma.reconciliationCycle.findMany({
+        where: {
+          lpId: {
+            in: context.lpIds,
+          },
+          ...(filters.storeLocation ? { storeLocationId: filters.storeLocation } : {}),
+          ...(statusFilter ? { status: statusFilter } : {}),
+          ...(monthRange
+            ? {
+                periodMonth: {
+                  gte: monthRange.start,
+                  lt: monthRange.end,
+                },
+              }
+            : {}),
+        },
+        orderBy: [{ periodMonth: "desc" }, { createdAt: "desc" }],
+        take: 100,
+        select: {
+          id: true,
+          periodMonth: true,
+          status: true,
+          storeLocation: {
+            select: {
+              id: true,
+              name: true,
+              storeOrganization: {
+                select: {
+                  name: true,
+                },
+              },
+            },
+          },
+          importBatches: {
+            orderBy: [{ isCurrent: "desc" }, { createdAt: "desc" }],
+            select: {
+              sourceType: true,
+              status: true,
+            },
+          },
+          mismatches: {
+            where: {
+              status: "OPEN",
+            },
+            select: {
+              id: true,
+            },
+          },
+          statements: {
+            orderBy: [{ version: "desc" }, { createdAt: "desc" }],
+            take: 1,
+            select: {
+              status: true,
+            },
+          },
+        },
+      }),
+    ]);
+
+    const availableStoreLocations = storeLocations.map((location) => ({
+      id: location.id,
+      label: `${location.name} · ${location.storeOrganization.name}`,
+    }));
+
+    if (rows.length === 0) {
+      return {
+        kind: "empty",
+        lpName: context.displayName,
+        filters,
+        availableStoreLocations,
+        isAdminPreview: context.isFallbackContext,
+        isAccessEmpty: false,
+      };
+    }
+
+    return {
+      kind: "ready",
+      lpName: context.displayName,
+      filters,
+      availableStoreLocations,
+      isAdminPreview: context.isFallbackContext,
+      rows: rows.map((row) => {
+        const lpBatch = row.importBatches.find((batch) => batch.sourceType === "LP");
+        const storeBatch = row.importBatches.find(
+          (batch) => batch.sourceType === "STORE",
+        );
+        const latestStatement = row.statements[0];
+
+        return {
+          id: row.id,
+          month: row.periodMonth,
+          storeOrganization: row.storeLocation.storeOrganization.name,
+          storeLocationId: row.storeLocation.id,
+          storeLocation: row.storeLocation.name,
+          cycleStatus: row.status,
+          lpUploadStatus: mapUploadStatus(lpBatch?.status),
+          storeUploadStatus: mapUploadStatus(storeBatch?.status),
+          mismatchCount: row.mismatches.length,
+          statementStatus: mapStatementStatus({
+            cycleStatus: row.status,
+            latestStatementStatus: latestStatement?.status,
+          }),
+        };
+      }),
+    };
+  } catch (error) {
+    console.error("Failed to load LP cycles", error);
+
     return {
       kind: "error",
       message:
         "We could not load reconciliation cycles right now. Try again shortly or contact VendorStream support if the issue persists.",
     };
   }
-
-  const availableStoreLocations = Array.from(
-    new Set(mockRows.map((row) => row.storeLocation)),
-  ).sort();
-
-  const filteredRows = mockRows.filter((row) => {
-    const monthMatch = !monthFilter || row.month === monthFilter;
-    const statusMatch = !statusFilter || row.cycleStatus === statusFilter;
-    const storeLocationMatch =
-      !storeLocationFilter || row.storeLocation === storeLocationFilter;
-
-    return monthMatch && statusMatch && storeLocationMatch;
-  });
-
-  if (mockMode === "empty" || filteredRows.length === 0) {
-    return {
-      kind: "empty",
-      lpName: "Northstar Beverage Group",
-      filters: {
-        month: monthFilter,
-        status: statusFilter,
-        storeLocation: storeLocationFilter,
-      },
-      availableStoreLocations,
-    };
-  }
-
-  return {
-    kind: "ready",
-    lpName: "Northstar Beverage Group",
-    filters: {
-      month: monthFilter,
-      status: statusFilter,
-      storeLocation: storeLocationFilter,
-    },
-    rows: filteredRows,
-    availableStoreLocations,
-  };
 }
 
 function Badge({
@@ -262,12 +394,11 @@ function FilterForm({
   filters,
   storeLocations,
 }: {
-  filters: {
-    month: string;
-    status: string;
-    storeLocation: string;
-  };
-  storeLocations: string[];
+  filters: CycleFilters;
+  storeLocations: Array<{
+    id: string;
+    label: string;
+  }>;
 }) {
   return (
     <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
@@ -311,18 +442,7 @@ function FilterForm({
               <option value="" className="bg-slate-950 text-white">
                 All statuses
               </option>
-              {[
-                "AWAITING_UPLOADS",
-                "PROCESSING",
-                "READY_FOR_RECONCILIATION",
-                "RECONCILING",
-                "MISMATCHES_FOUND",
-                "RECONCILIATION_PASSED",
-                "STATEMENT_PENDING",
-                "STATEMENT_GENERATING",
-                "STATEMENT_READY",
-                "FAILED",
-              ].map((status) => (
+              {STATUS_OPTIONS.map((status) => (
                 <option
                   key={status}
                   value={status}
@@ -352,11 +472,11 @@ function FilterForm({
               </option>
               {storeLocations.map((storeLocation) => (
                 <option
-                  key={storeLocation}
-                  value={storeLocation}
+                  key={storeLocation.id}
+                  value={storeLocation.id}
                   className="bg-slate-950 text-white"
                 >
-                  {storeLocation}
+                  {storeLocation.label}
                 </option>
               ))}
             </select>
@@ -384,34 +504,6 @@ function FilterForm({
   );
 }
 
-function LoadingState() {
-  return (
-    <div className="space-y-6">
-      <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
-        <CardHeader className="space-y-3">
-          <div className="h-6 w-32 animate-pulse rounded bg-white/10" />
-          <div className="h-10 animate-pulse rounded-xl bg-white/8" />
-        </CardHeader>
-      </Card>
-
-      <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
-        <CardHeader className="space-y-3">
-          <div className="h-5 w-52 animate-pulse rounded bg-white/10" />
-          <div className="h-4 w-72 animate-pulse rounded bg-white/10" />
-        </CardHeader>
-        <CardContent className="space-y-3">
-          {[0, 1, 2, 3].map((item) => (
-            <div
-              key={item}
-              className="h-24 animate-pulse rounded-2xl bg-white/8"
-            />
-          ))}
-        </CardContent>
-      </Card>
-    </div>
-  );
-}
-
 function ErrorState({ message }: { message: string }) {
   return (
     <Card className="border border-red-400/20 bg-red-500/8 shadow-2xl backdrop-blur-xl">
@@ -427,10 +519,7 @@ function ErrorState({ message }: { message: string }) {
         </CardDescription>
       </CardHeader>
       <CardContent className="flex flex-wrap gap-3">
-        <Button
-          asChild
-          className="bg-white text-slate-950 hover:bg-slate-100"
-        >
+        <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
           <Link href="/dashboard">Return to dashboard</Link>
         </Button>
         <Button
@@ -449,14 +538,17 @@ function EmptyState({
   lpName,
   filters,
   storeLocations,
+  isAdminPreview,
+  isAccessEmpty,
 }: {
   lpName: string;
-  filters: {
-    month: string;
-    status: string;
-    storeLocation: string;
-  };
-  storeLocations: string[];
+  filters: CycleFilters;
+  storeLocations: Array<{
+    id: string;
+    label: string;
+  }>;
+  isAdminPreview: boolean;
+  isAccessEmpty: boolean;
 }) {
   const hasFilters = Boolean(
     filters.month || filters.status || filters.storeLocation,
@@ -466,15 +558,24 @@ function EmptyState({
     <div className="space-y-6">
       <FilterForm filters={filters} storeLocations={storeLocations} />
 
+      {isAdminPreview ? (
+        <div className="rounded-2xl border border-amber-400/20 bg-amber-500/10 px-4 py-4 text-sm leading-6 text-amber-100">
+          Admin preview is showing LP cycle activity across active LP workspaces
+          because no explicit LP membership is attached to this user.
+        </div>
+      ) : null}
+
       <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
         <CardHeader className="space-y-2">
           <CardTitle className="text-2xl text-white">
             No reconciliation cycles found
           </CardTitle>
           <CardDescription className="text-sm leading-6 text-slate-300">
-            {hasFilters
-              ? "No cycle rows match the current filters."
-              : `There are no reconciliation cycles yet for ${lpName}.`}
+            {isAccessEmpty
+              ? "This account is not assigned to any LP workspace yet."
+              : hasFilters
+                ? "No cycle rows match the current filters."
+                : `There are no reconciliation cycles yet for ${lpName}.`}
           </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-wrap gap-3">
@@ -510,6 +611,13 @@ function ReadyState({
         filters={state.filters}
         storeLocations={state.availableStoreLocations}
       />
+
+      {state.isAdminPreview ? (
+        <div className="rounded-2xl border border-amber-400/20 bg-amber-500/10 px-4 py-4 text-sm leading-6 text-amber-100">
+          Admin preview is showing LP cycle activity across active LP workspaces
+          because no explicit LP membership is attached to this user.
+        </div>
+      ) : null}
 
       <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
         <CardHeader className="space-y-2">
@@ -677,13 +785,14 @@ export default async function LpCyclesPage({
           </div>
         </header>
 
-        {state.kind === "loading" ? <LoadingState /> : null}
         {state.kind === "error" ? <ErrorState message={state.message} /> : null}
         {state.kind === "empty" ? (
           <EmptyState
             lpName={state.lpName}
             filters={state.filters}
             storeLocations={state.availableStoreLocations}
+            isAdminPreview={state.isAdminPreview}
+            isAccessEmpty={state.isAccessEmpty}
           />
         ) : null}
         {state.kind === "ready" ? <ReadyState state={state} /> : null}

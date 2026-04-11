@@ -1,4 +1,9 @@
 import Link from "next/link";
+import { getServerSession } from "next-auth";
+import { redirect } from "next/navigation";
+import { prisma, type Prisma, type StatementStatus } from "@vendorstream/database";
+import { authOptions } from "@/app/api/auth/[...nextauth]/options";
+import { getLpAccessContextForUser } from "@/lib/lp-access-context";
 import {
   Card,
   CardContent,
@@ -8,19 +13,19 @@ import {
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 
-type StatementStatus = "DRAFT" | "FINAL" | "FAILED";
-
 type StatementRow = {
   id: string;
   cycleId: string;
-  month: string;
+  month: Date;
   storeOrganization: string;
+  storeLocationId: string;
   storeLocation: string;
   version: number;
   status: StatementStatus;
-  totalSalesAmount: number;
-  totalCommissionAmount: number;
-  generatedAt: string;
+  currency: string;
+  totalSalesAmount: Prisma.Decimal | null;
+  totalCommissionAmount: Prisma.Decimal | null;
+  generatedAt: Date | null;
   fileName: string | null;
 };
 
@@ -39,125 +44,63 @@ type StatementsState =
       filters: StatementFilters;
       rows: StatementRow[];
       selectedStatement: StatementRow | null;
-      availableStoreLocations: string[];
+      availableStoreLocations: Array<{
+        id: string;
+        label: string;
+      }>;
       summary: {
         finalCount: number;
         draftCount: number;
         totalSalesAmount: number;
         totalCommissionAmount: number;
       };
+      isAdminPreview: boolean;
     }
   | {
       kind: "empty";
       lpName: string;
       filters: StatementFilters;
-      availableStoreLocations: string[];
+      availableStoreLocations: Array<{
+        id: string;
+        label: string;
+      }>;
+      isAdminPreview: boolean;
+      isAccessEmpty: boolean;
     }
   | {
       kind: "error";
       message: string;
-    }
-  | {
-      kind: "loading";
     };
 
-const mockRows: StatementRow[] = [
-  {
-    id: "stmt_apr_downtown_v2",
-    cycleId: "cycle_apr_downtown",
-    month: "2026-04",
-    storeOrganization: "Maple Retail Group",
-    storeLocation: "Toronto Downtown",
-    version: 2,
-    status: "FINAL",
-    totalSalesAmount: 21452.19,
-    totalCommissionAmount: 2788.64,
-    generatedAt: "Apr 10, 2026 09:18 AM",
-    fileName: "statement_apr_2026_toronto_downtown_v2.pdf",
-  },
-  {
-    id: "stmt_apr_downtown_v1",
-    cycleId: "cycle_apr_downtown",
-    month: "2026-04",
-    storeOrganization: "Maple Retail Group",
-    storeLocation: "Toronto Downtown",
-    version: 1,
-    status: "DRAFT",
-    totalSalesAmount: 21398.77,
-    totalCommissionAmount: 2776.15,
-    generatedAt: "Apr 9, 2026 05:42 PM",
-    fileName: null,
-  },
-  {
-    id: "stmt_apr_waterfront_v1",
-    cycleId: "cycle_apr_waterfront",
-    month: "2026-04",
-    storeOrganization: "Maple Retail Group",
-    storeLocation: "Toronto Waterfront",
-    version: 1,
-    status: "DRAFT",
-    totalSalesAmount: 18421.08,
-    totalCommissionAmount: 2384.77,
-    generatedAt: "Apr 10, 2026 08:31 AM",
-    fileName: null,
-  },
-  {
-    id: "stmt_mar_mississauga_v3",
-    cycleId: "cycle_mar_mississauga",
-    month: "2026-03",
-    storeOrganization: "Summit Stores",
-    storeLocation: "Mississauga Central",
-    version: 3,
-    status: "FINAL",
-    totalSalesAmount: 19874.54,
-    totalCommissionAmount: 2571.83,
-    generatedAt: "Apr 3, 2026 02:16 PM",
-    fileName: "statement_mar_2026_mississauga_central_v3.pdf",
-  },
-  {
-    id: "stmt_feb_northyork_v2",
-    cycleId: "cycle_feb_northyork",
-    month: "2026-02",
-    storeOrganization: "Summit Stores",
-    storeLocation: "North York East",
-    version: 2,
-    status: "FAILED",
-    totalSalesAmount: 17652.91,
-    totalCommissionAmount: 2289.33,
-    generatedAt: "Mar 8, 2026 04:07 PM",
-    fileName: null,
-  },
-  {
-    id: "stmt_jan_brampton_v1",
-    cycleId: "cycle_jan_brampton",
-    month: "2026-01",
-    storeOrganization: "Metro Beverage Partners",
-    storeLocation: "Brampton West",
-    version: 1,
-    status: "FINAL",
-    totalSalesAmount: 16443.5,
-    totalCommissionAmount: 2132.41,
-    generatedAt: "Feb 6, 2026 10:11 AM",
-    fileName: "statement_jan_2026_brampton_west_v1.pdf",
-  },
-];
+const STATUS_OPTIONS: StatementStatus[] = ["DRAFT", "FINAL", "FAILED"];
 
-function formatMonthLabel(value: string) {
-  const [year, month] = value.split("-");
-  const parsedDate = new Date(Number(year), Number(month) - 1, 1);
-
+function formatMonthLabel(value: Date) {
   return new Intl.DateTimeFormat("en-US", {
     month: "long",
     year: "numeric",
-  }).format(parsedDate);
+  }).format(value);
 }
 
-function formatCurrency(value: number) {
+function formatCurrency(value: number, currency = "CAD") {
   return new Intl.NumberFormat("en-US", {
     style: "currency",
-    currency: "USD",
+    currency,
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
+  }).format(value);
+}
+
+function formatDateTime(value: Date | null) {
+  if (!value) {
+    return "Not available";
+  }
+
+  return new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
   }).format(value);
 }
 
@@ -200,6 +143,22 @@ function buildStatementsHref(filters: StatementFilters) {
   return query ? `/lp/statements?${query}` : "/lp/statements";
 }
 
+function parseMonthFilter(value: string) {
+  if (!/^\d{4}-\d{2}$/.test(value)) {
+    return null;
+  }
+
+  const [year, month] = value.split("-").map((part) => Number(part));
+  const start = new Date(Date.UTC(year, month - 1, 1, 0, 0, 0, 0));
+  const end = new Date(Date.UTC(year, month, 1, 0, 0, 0, 0));
+
+  return { start, end };
+}
+
+function decimalToNumber(value: Prisma.Decimal | null | undefined) {
+  return value ? value.toNumber() : 0;
+}
+
 async function getLpStatementsState(searchParams?: {
   month?: string;
   storeLocation?: string;
@@ -207,7 +166,16 @@ async function getLpStatementsState(searchParams?: {
   cycleId?: string;
   statementId?: string;
 }): Promise<StatementsState> {
-  const mockMode = process.env.MOCK_LP_STATEMENTS_STATE;
+  const session = await getServerSession(authOptions);
+
+  if (!session?.user) {
+    redirect("/login");
+  }
+
+  if (!session.user.id) {
+    redirect("/login");
+  }
+
   const filters: StatementFilters = {
     month: searchParams?.month?.trim() ?? "",
     storeLocation: searchParams?.storeLocation?.trim() ?? "",
@@ -216,66 +184,179 @@ async function getLpStatementsState(searchParams?: {
     statementId: searchParams?.statementId?.trim() ?? "",
   };
 
-  if (mockMode === "loading") {
-    return { kind: "loading" };
-  }
+  try {
+    const context = await getLpAccessContextForUser({
+      userId: session.user.id,
+      systemRole: session.user.systemRole,
+    });
 
-  if (mockMode === "error") {
+    if (context.lpIds.length === 0) {
+      return {
+        kind: "empty",
+        lpName: context.displayName,
+        filters,
+        availableStoreLocations: [],
+        isAdminPreview: false,
+        isAccessEmpty: true,
+      };
+    }
+
+    const monthRange = parseMonthFilter(filters.month);
+    const statusFilter = STATUS_OPTIONS.includes(filters.status as StatementStatus)
+      ? (filters.status as StatementStatus)
+      : undefined;
+
+    const [storeLocations, rows] = await Promise.all([
+      prisma.storeLocation.findMany({
+        where: {
+          lpAssignments: {
+            some: {
+              lpId: {
+                in: context.lpIds,
+              },
+              isActive: true,
+            },
+          },
+        },
+        select: {
+          id: true,
+          name: true,
+          storeOrganization: {
+            select: {
+              name: true,
+            },
+          },
+        },
+        orderBy: [{ storeOrganization: { name: "asc" } }, { name: "asc" }],
+      }),
+      prisma.statement.findMany({
+        where: {
+          cycle: {
+            lpId: {
+              in: context.lpIds,
+            },
+            ...(filters.storeLocation
+              ? { storeLocationId: filters.storeLocation }
+              : {}),
+            ...(filters.cycleId ? { id: filters.cycleId } : {}),
+            ...(monthRange
+              ? {
+                  periodMonth: {
+                    gte: monthRange.start,
+                    lt: monthRange.end,
+                  },
+                }
+              : {}),
+          },
+          ...(statusFilter ? { status: statusFilter } : {}),
+        },
+        orderBy: [
+          { generatedAt: "desc" },
+          { createdAt: "desc" },
+          { version: "desc" },
+        ],
+        take: 100,
+        select: {
+          id: true,
+          cycleId: true,
+          version: true,
+          status: true,
+          currency: true,
+          totalSalesAmount: true,
+          totalCommissionAmount: true,
+          generatedAt: true,
+          generatedFile: {
+            select: {
+              originalFilename: true,
+            },
+          },
+          cycle: {
+            select: {
+              periodMonth: true,
+              storeLocation: {
+                select: {
+                  id: true,
+                  name: true,
+                  storeOrganization: {
+                    select: {
+                      name: true,
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      }),
+    ]);
+
+    const availableStoreLocations = storeLocations.map((location) => ({
+      id: location.id,
+      label: `${location.name} · ${location.storeOrganization.name}`,
+    }));
+
+    if (rows.length === 0) {
+      return {
+        kind: "empty",
+        lpName: context.displayName,
+        filters,
+        availableStoreLocations,
+        isAdminPreview: context.isFallbackContext,
+        isAccessEmpty: false,
+      };
+    }
+
+    const mappedRows: StatementRow[] = rows.map((row) => ({
+      id: row.id,
+      cycleId: row.cycleId,
+      month: row.cycle.periodMonth,
+      storeOrganization: row.cycle.storeLocation.storeOrganization.name,
+      storeLocationId: row.cycle.storeLocation.id,
+      storeLocation: row.cycle.storeLocation.name,
+      version: row.version,
+      status: row.status,
+      currency: row.currency,
+      totalSalesAmount: row.totalSalesAmount,
+      totalCommissionAmount: row.totalCommissionAmount,
+      generatedAt: row.generatedAt,
+      fileName: row.generatedFile?.originalFilename ?? null,
+    }));
+
+    const selectedStatement =
+      mappedRows.find((row) => row.id === filters.statementId) ??
+      mappedRows[0] ??
+      null;
+
+    return {
+      kind: "ready",
+      lpName: context.displayName,
+      filters,
+      rows: mappedRows,
+      selectedStatement,
+      availableStoreLocations,
+      isAdminPreview: context.isFallbackContext,
+      summary: {
+        finalCount: mappedRows.filter((row) => row.status === "FINAL").length,
+        draftCount: mappedRows.filter((row) => row.status === "DRAFT").length,
+        totalSalesAmount: mappedRows.reduce(
+          (sum, row) => sum + decimalToNumber(row.totalSalesAmount),
+          0,
+        ),
+        totalCommissionAmount: mappedRows.reduce(
+          (sum, row) => sum + decimalToNumber(row.totalCommissionAmount),
+          0,
+        ),
+      },
+    };
+  } catch (error) {
+    console.error("Failed to load LP statements", error);
+
     return {
       kind: "error",
       message:
         "We could not load LP statements right now. Try again shortly or contact VendorStream support if the issue persists.",
     };
   }
-
-  const availableStoreLocations = Array.from(
-    new Set(mockRows.map((row) => row.storeLocation)),
-  ).sort();
-
-  const filteredRows = mockRows.filter((row) => {
-    const monthMatch = !filters.month || row.month === filters.month;
-    const storeLocationMatch =
-      !filters.storeLocation || row.storeLocation === filters.storeLocation;
-    const statusMatch = !filters.status || row.status === filters.status;
-    const cycleMatch = !filters.cycleId || row.cycleId === filters.cycleId;
-
-    return monthMatch && storeLocationMatch && statusMatch && cycleMatch;
-  });
-
-  if (mockMode === "empty" || filteredRows.length === 0) {
-    return {
-      kind: "empty",
-      lpName: "Northstar Beverage Group",
-      filters,
-      availableStoreLocations,
-    };
-  }
-
-  const selectedStatement =
-    filteredRows.find((row) => row.id === filters.statementId) ??
-    filteredRows[0] ??
-    null;
-
-  return {
-    kind: "ready",
-    lpName: "Northstar Beverage Group",
-    filters,
-    rows: filteredRows,
-    selectedStatement,
-    availableStoreLocations,
-    summary: {
-      finalCount: filteredRows.filter((row) => row.status === "FINAL").length,
-      draftCount: filteredRows.filter((row) => row.status === "DRAFT").length,
-      totalSalesAmount: filteredRows.reduce(
-        (sum, row) => sum + row.totalSalesAmount,
-        0,
-      ),
-      totalCommissionAmount: filteredRows.reduce(
-        (sum, row) => sum + row.totalCommissionAmount,
-        0,
-      ),
-    },
-  };
 }
 
 function SummaryCard({
@@ -336,7 +417,10 @@ function FilterForm({
   storeLocations,
 }: {
   filters: StatementFilters;
-  storeLocations: string[];
+  storeLocations: Array<{
+    id: string;
+    label: string;
+  }>;
 }) {
   const resetHref = buildStatementsHref({
     ...filters,
@@ -395,11 +479,11 @@ function FilterForm({
               </option>
               {storeLocations.map((storeLocation) => (
                 <option
-                  key={storeLocation}
-                  value={storeLocation}
+                  key={storeLocation.id}
+                  value={storeLocation.id}
                   className="bg-slate-950 text-white"
                 >
-                  {storeLocation}
+                  {storeLocation.label}
                 </option>
               ))}
             </select>
@@ -421,7 +505,7 @@ function FilterForm({
               <option value="" className="bg-slate-950 text-white">
                 All statuses
               </option>
-              {["DRAFT", "FINAL", "FAILED"].map((status) => (
+              {STATUS_OPTIONS.map((status) => (
                 <option
                   key={status}
                   value={status}
@@ -452,66 +536,6 @@ function FilterForm({
         </form>
       </CardContent>
     </Card>
-  );
-}
-
-function LoadingState() {
-  return (
-    <div className="space-y-6">
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-        {[0, 1, 2, 3].map((item) => (
-          <Card
-            key={item}
-            className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl"
-          >
-            <CardHeader className="space-y-3">
-              <div className="h-3 w-36 animate-pulse rounded bg-white/10" />
-              <div className="h-10 w-32 animate-pulse rounded bg-white/10" />
-            </CardHeader>
-            <CardContent>
-              <div className="h-10 animate-pulse rounded-xl bg-white/8" />
-            </CardContent>
-          </Card>
-        ))}
-      </div>
-
-      <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
-        <CardHeader className="space-y-3">
-          <div className="h-6 w-40 animate-pulse rounded bg-white/10" />
-          <div className="h-10 animate-pulse rounded-xl bg-white/8" />
-        </CardHeader>
-      </Card>
-
-      <div className="grid gap-4 xl:grid-cols-[1.35fr_0.65fr]">
-        <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
-          <CardHeader className="space-y-3">
-            <div className="h-5 w-56 animate-pulse rounded bg-white/10" />
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {[0, 1, 2, 3].map((item) => (
-              <div
-                key={item}
-                className="h-24 animate-pulse rounded-2xl bg-white/8"
-              />
-            ))}
-          </CardContent>
-        </Card>
-
-        <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
-          <CardHeader className="space-y-3">
-            <div className="h-5 w-44 animate-pulse rounded bg-white/10" />
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {[0, 1, 2].map((item) => (
-              <div
-                key={item}
-                className="h-14 animate-pulse rounded-xl bg-white/8"
-              />
-            ))}
-          </CardContent>
-        </Card>
-      </div>
-    </div>
   );
 }
 
@@ -549,6 +573,8 @@ function EmptyState({
   lpName,
   filters,
   availableStoreLocations,
+  isAdminPreview,
+  isAccessEmpty,
 }: Extract<StatementsState, { kind: "empty" }>) {
   const hasFilters = Boolean(
     filters.month || filters.storeLocation || filters.status || filters.cycleId,
@@ -558,15 +584,24 @@ function EmptyState({
     <div className="space-y-6">
       <FilterForm filters={filters} storeLocations={availableStoreLocations} />
 
+      {isAdminPreview ? (
+        <div className="rounded-2xl border border-amber-400/20 bg-amber-500/10 px-4 py-4 text-sm leading-6 text-amber-100">
+          Admin preview is showing LP statement activity across active LP
+          workspaces because no explicit LP membership is attached to this user.
+        </div>
+      ) : null}
+
       <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
         <CardHeader className="space-y-2">
           <CardTitle className="text-2xl text-white">
             No statements found
           </CardTitle>
           <CardDescription className="text-sm leading-6 text-slate-300">
-            {hasFilters
-              ? "No statement versions match the current filters."
-              : `There are no generated statements yet for ${lpName}.`}
+            {isAccessEmpty
+              ? "This account is not assigned to any LP workspace yet."
+              : hasFilters
+                ? "No statement versions match the current filters."
+                : `There are no generated statements yet for ${lpName}.`}
           </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-wrap gap-3">
@@ -608,6 +643,7 @@ function ReadyState({
   selectedStatement,
   availableStoreLocations,
   summary,
+  isAdminPreview,
 }: Extract<StatementsState, { kind: "ready" }>) {
   return (
     <div className="space-y-6">
@@ -640,6 +676,13 @@ function ReadyState({
 
       <FilterForm filters={filters} storeLocations={availableStoreLocations} />
 
+      {isAdminPreview ? (
+        <div className="rounded-2xl border border-amber-400/20 bg-amber-500/10 px-4 py-4 text-sm leading-6 text-amber-100">
+          Admin preview is showing LP statement activity across active LP
+          workspaces because no explicit LP membership is attached to this user.
+        </div>
+      ) : null}
+
       <div className="grid gap-4 xl:grid-cols-[1.35fr_0.65fr]">
         <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
           <CardHeader className="space-y-2">
@@ -654,7 +697,10 @@ function ReadyState({
           <CardContent className="space-y-3">
             {rows.map((row) => {
               const isSelected = row.id === selectedStatement?.id;
-              const viewHref = `/lp/statements/${row.id}`;
+              const viewHref = buildStatementsHref({
+                ...filters,
+                statementId: row.id,
+              });
 
               return (
                 <div
@@ -716,7 +762,10 @@ function ReadyState({
                         Total sales amount
                       </div>
                       <div className="text-sm text-white">
-                        {formatCurrency(row.totalSalesAmount)}
+                        {formatCurrency(
+                          decimalToNumber(row.totalSalesAmount),
+                          row.currency,
+                        )}
                       </div>
                     </div>
 
@@ -725,7 +774,10 @@ function ReadyState({
                         Total commission amount
                       </div>
                       <div className="text-sm text-white">
-                        {formatCurrency(row.totalCommissionAmount)}
+                        {formatCurrency(
+                          decimalToNumber(row.totalCommissionAmount),
+                          row.currency,
+                        )}
                       </div>
                     </div>
 
@@ -734,7 +786,7 @@ function ReadyState({
                         Generated at
                       </div>
                       <div className="text-sm text-slate-300">
-                        {row.generatedAt}
+                        {formatDateTime(row.generatedAt)}
                       </div>
                     </div>
 
@@ -806,28 +858,31 @@ function ReadyState({
                 />
                 <DetailRow
                   label="Total sales"
-                  value={formatCurrency(selectedStatement.totalSalesAmount)}
+                  value={formatCurrency(
+                    decimalToNumber(selectedStatement.totalSalesAmount),
+                    selectedStatement.currency,
+                  )}
                 />
                 <DetailRow
                   label="Total commission"
                   value={formatCurrency(
-                    selectedStatement.totalCommissionAmount,
+                    decimalToNumber(selectedStatement.totalCommissionAmount),
+                    selectedStatement.currency,
                   )}
                 />
                 <DetailRow
                   label="Generated at"
-                  value={selectedStatement.generatedAt}
+                  value={formatDateTime(selectedStatement.generatedAt)}
                 />
                 <DetailRow
                   label="Download file"
-                  value={
-                    selectedStatement.fileName ?? "Pending file generation"
-                  }
+                  value={selectedStatement.fileName ?? "Pending file generation"}
                 />
                 <div className="rounded-xl border border-dashed border-white/15 bg-slate-950/25 px-4 py-4 text-sm leading-6 text-slate-300">
-                  Statement viewing and file download endpoints can be connected
-                  later without changing this page structure. The selected
-                  statement state is already URL-driven through `statementId`.
+                  The statement list and selected-version panel now use real
+                  Prisma data. Detailed LP-side statement delivery and download
+                  endpoints can be connected separately without changing this page
+                  structure.
                 </div>
               </>
             ) : (
@@ -881,7 +936,6 @@ export default async function LpStatementsPage({
           </div>
         </header>
 
-        {state.kind === "loading" ? <LoadingState /> : null}
         {state.kind === "error" ? <ErrorState message={state.message} /> : null}
         {state.kind === "empty" ? (
           <EmptyState
@@ -889,6 +943,8 @@ export default async function LpStatementsPage({
             lpName={state.lpName}
             filters={state.filters}
             availableStoreLocations={state.availableStoreLocations}
+            isAdminPreview={state.isAdminPreview}
+            isAccessEmpty={state.isAccessEmpty}
           />
         ) : null}
         {state.kind === "ready" ? (
@@ -900,6 +956,7 @@ export default async function LpStatementsPage({
             selectedStatement={state.selectedStatement}
             availableStoreLocations={state.availableStoreLocations}
             summary={state.summary}
+            isAdminPreview={state.isAdminPreview}
           />
         ) : null}
       </div>
