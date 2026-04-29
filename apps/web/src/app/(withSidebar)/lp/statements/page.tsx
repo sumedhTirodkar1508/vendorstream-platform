@@ -2,7 +2,10 @@ import Link from "next/link";
 import { getServerSession } from "next-auth";
 import { redirect } from "next/navigation";
 import { prisma, type Prisma, type StatementStatus } from "@vendorstream/database";
+import { FileText } from "lucide-react";
 import { authOptions } from "@/app/api/auth/[...nextauth]/options";
+import { EmptyState as AppEmptyState } from "@/components/empty-state";
+import { StatusBadge } from "@/components/ui/status-badge";
 import { getLpAccessContextForUser } from "@/lib/lp-access-context";
 import {
   Card,
@@ -12,6 +15,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { formatDateTime, formatMonthLabel } from "@/lib/formatting";
 
 type StatementRow = {
   id: string;
@@ -74,33 +78,12 @@ type StatementsState =
 
 const STATUS_OPTIONS: StatementStatus[] = ["DRAFT", "FINAL", "FAILED"];
 
-function formatMonthLabel(value: Date) {
-  return new Intl.DateTimeFormat("en-US", {
-    month: "long",
-    year: "numeric",
-  }).format(value);
-}
-
 function formatCurrency(value: number, currency = "CAD") {
   return new Intl.NumberFormat("en-US", {
     style: "currency",
     currency,
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
-  }).format(value);
-}
-
-function formatDateTime(value: Date | null) {
-  if (!value) {
-    return "Not available";
-  }
-
-  return new Intl.DateTimeFormat("en-US", {
-    month: "short",
-    day: "numeric",
-    year: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
   }).format(value);
 }
 
@@ -591,47 +574,46 @@ function EmptyState({
         </div>
       ) : null}
 
-      <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
-        <CardHeader className="space-y-2">
-          <CardTitle className="text-2xl text-white">
-            No statements found
-          </CardTitle>
-          <CardDescription className="text-sm leading-6 text-slate-300">
-            {isAccessEmpty
-              ? "This account is not assigned to any LP workspace yet."
-              : hasFilters
-                ? "No statement versions match the current filters."
-                : `There are no generated statements yet for ${lpName}.`}
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="flex flex-wrap gap-3">
-          <Button
-            asChild
-            className="bg-white text-slate-950 hover:bg-slate-100"
-          >
-            <Link href="/lp/cycles">Review reconciliation cycles</Link>
-          </Button>
-          {hasFilters ? (
+      <AppEmptyState
+        icon={<FileText className="h-5 w-5" />}
+        title="No statements found"
+        description={
+          isAccessEmpty
+            ? "This account is not assigned to any LP workspace yet."
+            : hasFilters
+              ? "No statement versions match the current filters."
+              : `There are no generated statements yet for ${lpName}.`
+        }
+        actions={
+          <>
             <Button
               asChild
-              variant="outline"
-              className="border-white/15 bg-white/5 text-white hover:bg-white/10"
+              className="bg-white text-slate-950 hover:bg-slate-100"
             >
-              <Link
-                href={buildStatementsHref({
-                  ...filters,
-                  month: "",
-                  storeLocation: "",
-                  status: "",
-                  statementId: "",
-                })}
-              >
-                Clear filters
-              </Link>
+              <Link href="/lp/cycles">Review reconciliation cycles</Link>
             </Button>
-          ) : null}
-        </CardContent>
-      </Card>
+            {hasFilters ? (
+              <Button
+                asChild
+                variant="outline"
+                className="border-white/15 bg-white/5 text-white hover:bg-white/10"
+              >
+                <Link
+                  href={buildStatementsHref({
+                    ...filters,
+                    month: "",
+                    storeLocation: "",
+                    status: "",
+                    statementId: "",
+                  })}
+                >
+                  Clear filters
+                </Link>
+              </Button>
+            ) : null}
+          </>
+        }
+      />
     </div>
   );
 }
@@ -750,11 +732,10 @@ function ReadyState({
                       <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
                         Status
                       </div>
-                      <span
-                        className={`inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-medium ${getStatusTone(row.status)}`}
-                      >
-                        {row.status}
-                      </span>
+                      <StatusBadge
+                        label={row.status}
+                        className={getStatusTone(row.status)}
+                      />
                     </div>
 
                     <div className="space-y-1">
@@ -849,11 +830,10 @@ function ReadyState({
                 <DetailRow
                   label="Status"
                   value={
-                    <span
-                      className={`inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-medium ${getStatusTone(selectedStatement.status)}`}
-                    >
-                      {selectedStatement.status}
-                    </span>
+                    <StatusBadge
+                      label={selectedStatement.status}
+                      className={getStatusTone(selectedStatement.status)}
+                    />
                   }
                 />
                 <DetailRow

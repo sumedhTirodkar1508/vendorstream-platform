@@ -1,6 +1,11 @@
 import { createHash, randomInt } from "node:crypto";
 import { NextResponse } from "next/server";
 import { prisma, Prisma } from "@vendorstream/database";
+import { sendVerificationEmail } from "@/lib/email/send-verification-email";
+import {
+  EmailConfigurationError,
+  EmailDeliveryError,
+} from "@/lib/email/transactional";
 
 const VERIFICATION_CODE_EXPIRY_MS = 10 * 60 * 1000;
 
@@ -50,24 +55,21 @@ function hashVerificationCode(code: string) {
   return createHash("sha256").update(code).digest("hex");
 }
 
-async function sendVerificationCodeEmail(input: {
-  email: string;
-  code: string;
-}) {
-  if (process.env.NODE_ENV !== "production") {
-    console.info("[auth/send-email-verification] verification code generated", {
-      email: input.email,
-      code: input.code,
-    });
-  }
+function buildVerificationUrl(request: Request, email: string) {
+  const origin = new URL(request.url).origin;
+  const verificationUrl = new URL("/verify-email", origin);
 
-  // Stub only. Replace this with a Resend-backed implementation later.
+  verificationUrl.searchParams.set("email", email);
+
+  return verificationUrl.toString();
 }
 
 export async function POST(request: Request) {
+  let email = "";
+
   try {
     const requestBody = await request.json().catch(() => null);
-    const email = normalizeEmail(requestBody?.email);
+    email = normalizeEmail(requestBody?.email);
 
     if (!email || !isValidEmail(email)) {
       return errorResponse("A valid email address is required.", 400);
@@ -111,13 +113,33 @@ export async function POST(request: Request) {
       });
     });
 
-    await sendVerificationCodeEmail({
+    await sendVerificationEmail({
       email: user.email,
       code: verificationCode,
+      verificationUrl: buildVerificationUrl(request, user.email),
     });
 
     return successResponse("Verification code sent successfully.");
   } catch (error) {
+    if (error instanceof EmailConfigurationError) {
+      console.error("[auth/send-email-verification] email configuration error", {
+        email,
+        message: error.message,
+      });
+      return errorResponse("Email delivery is not configured.", 503);
+    }
+
+    if (error instanceof EmailDeliveryError) {
+      console.error("[auth/send-email-verification] delivery failed", {
+        email,
+        message: error.message,
+      });
+      return errorResponse(
+        "Verification email could not be sent right now. Please try again shortly.",
+        502,
+      );
+    }
+
     console.error("[auth/send-email-verification] failed", error);
     return errorResponse("Failed to send verification code.", 500);
   }

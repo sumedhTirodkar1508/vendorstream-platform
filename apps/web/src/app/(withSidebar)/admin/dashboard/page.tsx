@@ -10,6 +10,8 @@ import {
   type StatementTaskStatus,
 } from "@vendorstream/database";
 import { authOptions } from "@/app/api/auth/[...nextauth]/options";
+import { PageErrorState } from "@/components/page-error-state";
+import { formatMonthLabel } from "@/lib/format";
 import {
   Card,
   CardContent,
@@ -135,10 +137,7 @@ function formatDateTime(date: Date) {
 }
 
 function formatMonth(date: Date) {
-  return new Intl.DateTimeFormat("en-US", {
-    month: "long",
-    year: "numeric",
-  }).format(date);
+  return formatMonthLabel(date);
 }
 
 function formatEnumLabel(value: string) {
@@ -592,52 +591,6 @@ async function getAdminDashboardState(
   }
 }
 
-function ForbiddenState() {
-  return (
-    <Card className="border border-red-400/20 bg-red-500/8 shadow-2xl backdrop-blur-xl">
-      <CardHeader className="space-y-3">
-        <div className="inline-flex w-fit items-center rounded-full border border-red-400/30 bg-red-500/10 px-3 py-1 text-xs font-medium uppercase tracking-[0.18em] text-red-100">
-          Access restricted
-        </div>
-        <CardTitle className="text-2xl text-white">
-          Admin access is required
-        </CardTitle>
-        <CardDescription className="text-sm leading-6 text-red-100/90">
-          This dashboard is limited to VendorStream platform administrators.
-        </CardDescription>
-      </CardHeader>
-      <CardContent>
-        <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
-          <Link href="/dashboard">Back to dashboard</Link>
-        </Button>
-      </CardContent>
-    </Card>
-  );
-}
-
-function ErrorState({ message }: { message: string }) {
-  return (
-    <Card className="border border-red-400/20 bg-red-500/8 shadow-2xl backdrop-blur-xl">
-      <CardHeader className="space-y-3">
-        <div className="inline-flex w-fit items-center rounded-full border border-red-400/30 bg-red-500/10 px-3 py-1 text-xs font-medium uppercase tracking-[0.18em] text-red-100">
-          Dashboard unavailable
-        </div>
-        <CardTitle className="text-2xl text-white">
-          Admin operations data could not be loaded
-        </CardTitle>
-        <CardDescription className="text-sm leading-6 text-red-100/90">
-          {message}
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="flex flex-wrap gap-3">
-        <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
-          <Link href="/dashboard">Back to dashboard</Link>
-        </Button>
-      </CardContent>
-    </Card>
-  );
-}
-
 function EmptyState({
   adminName,
   platform,
@@ -705,13 +658,22 @@ export default async function AdminDashboardPage() {
             <div className="inline-flex w-fit items-center rounded-full border border-white/10 bg-white/6 px-3 py-1 text-xs font-medium uppercase tracking-[0.2em] text-slate-200">
               Admin Dashboard
             </div>
-            <div className="space-y-2">
+          <div className="space-y-2">
               <h1 className="text-4xl font-semibold tracking-tight text-white sm:text-5xl">
                 Platform operations
               </h1>
             </div>
           </header>
-          <ForbiddenState />
+          <PageErrorState
+            variant="forbidden"
+            title="Admin access is required"
+            description="This dashboard is limited to VendorStream platform administrators."
+            actions={
+              <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
+                <Link href="/dashboard">Back to dashboard</Link>
+              </Button>
+            }
+          />
         </div>
       </main>
     );
@@ -761,7 +723,19 @@ export default async function AdminDashboardPage() {
           ) : null}
         </header>
 
-        {state.kind === "error" ? <ErrorState message={state.message} /> : null}
+        {state.kind === "error" ? (
+          <PageErrorState
+            variant="error"
+            badgeLabel="Dashboard unavailable"
+            title="Admin operations data could not be loaded"
+            description={state.message}
+            actions={
+              <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
+                <Link href="/dashboard">Back to dashboard</Link>
+              </Button>
+            }
+          />
+        ) : null}
         {state.kind === "empty" ? <EmptyState {...state} /> : null}
 
         {state.kind === "ready" ? (

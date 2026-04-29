@@ -2,7 +2,10 @@ import Link from "next/link";
 import { getServerSession } from "next-auth";
 import { redirect } from "next/navigation";
 import { prisma, type CycleStatus } from "@vendorstream/database";
+import { MapPinned } from "lucide-react";
 import { authOptions } from "@/app/api/auth/[...nextauth]/options";
+import { EmptyState as AppEmptyState } from "@/components/empty-state";
+import { formatMonthLabel } from "@/lib/format";
 import {
   Card,
   CardContent,
@@ -132,10 +135,7 @@ function formatDateTime(date: Date | null) {
 }
 
 function formatMonth(date: Date) {
-  return new Intl.DateTimeFormat("en-US", {
-    month: "long",
-    year: "numeric",
-  }).format(date);
+  return formatMonthLabel(date);
 }
 
 function buildStoreLocationsHref(filters: StoreLocationFilters) {
@@ -676,30 +676,29 @@ function EmptyState({
         </CardContent>
       </Card>
 
-      <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
-        <CardHeader className="space-y-2">
-          <CardTitle className="text-2xl text-white">
-            No store locations found
-          </CardTitle>
-          <CardDescription className="text-sm leading-6 text-slate-300">
-            {hasFilters
-              ? "No store locations match the current filter set."
-              : "No store locations are currently available in this environment."}
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="flex flex-wrap gap-3">
-          <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
-            <Link href="/admin/dashboard">Back to admin dashboard</Link>
-          </Button>
-          <Button
-            asChild
-            variant="outline"
-            className="border-white/15 bg-white/5 text-white hover:bg-white/10"
-          >
-            <Link href="/admin/store-locations">Reset filters</Link>
-          </Button>
-        </CardContent>
-      </Card>
+      <AppEmptyState
+        icon={<MapPinned className="h-5 w-5" />}
+        title="No store locations found"
+        description={
+          hasFilters
+            ? "No store locations match the current filter set."
+            : "No store locations are currently available in this environment."
+        }
+        actions={
+          <>
+            <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
+              <Link href="/admin/dashboard">Back to admin dashboard</Link>
+            </Button>
+            <Button
+              asChild
+              variant="outline"
+              className="border-white/15 bg-white/5 text-white hover:bg-white/10"
+            >
+              <Link href="/admin/store-locations">Reset filters</Link>
+            </Button>
+          </>
+        }
+      />
     </div>
   );
 }

@@ -1,74 +1,96 @@
 import { NextRequest, NextResponse } from "next/server";
-// export { default } from "next-auth/middleware";
 import { getToken } from "next-auth/jwt";
 
+const AUTH_ROUTES = ["/login", "/signup", "/verify-email"] as const;
+const PROTECTED_ROUTE_PREFIXES = [
+  "/admin",
+  "/dashboard",
+  "/lp",
+  "/store",
+  "/audit",
+  "/notifications",
+] as const;
+
+function isAuthRoute(pathname: string) {
+  return AUTH_ROUTES.some(
+    (route) => pathname === route || pathname.startsWith(`${route}/`),
+  );
+}
+
+function isProtectedRoute(pathname: string) {
+  return PROTECTED_ROUTE_PREFIXES.some(
+    (prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`),
+  );
+}
+
+function getDefaultWorkspaceHref(role?: string) {
+  if (role === "ADMIN") {
+    return "/admin/dashboard";
+  }
+
+  if (role === "FINANCE_VIEWER") {
+    return "/audit";
+  }
+
+  return "/dashboard";
+}
+
+function getLoginRedirectUrl(request: NextRequest) {
+  const loginUrl = new URL("/login", request.url);
+  const nextPath = `${request.nextUrl.pathname}${request.nextUrl.search}`;
+
+  if (nextPath && nextPath !== "/") {
+    loginUrl.searchParams.set("next", nextPath);
+  }
+
+  return loginUrl;
+}
+
 export async function middleware(request: NextRequest) {
-  const url = request.nextUrl;
-  console.log("Middleware invoked for:", url.pathname);
+  const pathname = request.nextUrl.pathname;
   const token = await getToken({ req: request }).catch(() => null);
-
-  // Redirect temporary users away from all pages except allowed ones
-  // if (
-  //   token &&
-  //   token.isTemporary &&
-  //   !(
-  //     url.pathname.startsWith("/my-scanned-qrs") ||
-  //     url.pathname.startsWith("/victim-information") ||
-  //     url.pathname.startsWith("/qr-scanner")
-  //   )
-  // ) {
-  //   return NextResponse.redirect(new URL("/my-scanned-qrs", request.url));
-  // }
-
-  const isAuthPage =
-    url.pathname.startsWith("/login") ||
-    url.pathname.startsWith("/signup") ||
-    url.pathname.startsWith("/verify-email");
-
-  const isAdminRoute = url.pathname.startsWith("/admin");
-  const isProtectedRoute =
-    isAdminRoute ||
-    url.pathname.startsWith("/dashboard") ||
-    url.pathname.startsWith("/generateQR") ||
-    url.pathname.startsWith("/control-panel") ||
-    url.pathname.startsWith("/view-all-songs") ||
-    url.pathname.startsWith("/user-management") ||
-    url.pathname.startsWith("/qr-management");
+  const isAuthPage = isAuthRoute(pathname);
+  const requiresAuthentication = isProtectedRoute(pathname);
+  const defaultWorkspaceHref = getDefaultWorkspaceHref(token?.systemRole);
 
   // 1) If logged in, keep them out of auth pages
   if (token && isAuthPage) {
-    return NextResponse.redirect(new URL("/dashboard", request.url));
+    return NextResponse.redirect(new URL(defaultWorkspaceHref, request.url));
   }
 
   // 2) If not logged in, block protected routes
-  if (!token && isProtectedRoute) {
-    return NextResponse.redirect(new URL("/login", request.url));
+  if (!token && requiresAuthentication) {
+    return NextResponse.redirect(getLoginRedirectUrl(request));
   }
 
   // 3) If logged in but NOT admin, block /admin/*
-  if (token && isAdminRoute) {
-    const role = (token as any).role; // must exist in token (see section 2)
-    if (role !== "ADMIN") {
-      return NextResponse.redirect(new URL("/dashboard", request.url));
-    }
+  if (token && pathname.startsWith("/admin") && token.systemRole !== "ADMIN") {
+    return NextResponse.redirect(new URL(defaultWorkspaceHref, request.url));
   }
 
-  // Allow access to public pages (e.g., home, about, signup)
+  // 4) If logged in but missing operations role, block /audit
+  if (
+    token &&
+    pathname.startsWith("/audit") &&
+    token.systemRole !== "ADMIN" &&
+    token.systemRole !== "FINANCE_VIEWER"
+  ) {
+    return NextResponse.redirect(new URL(defaultWorkspaceHref, request.url));
+  }
+
   return NextResponse.next();
 }
-// See "Matching Paths" below to learn more
+
 export const config = {
   matcher: [
     "/login",
     "/signup",
-    "/sign-up",
     "/verify-email",
     "/admin/:path*",
     "/dashboard/:path*",
-    "/generateQR/:path*",
-    "/control-panel/:path*",
-    "/view-all-songs/:path*",
-    "/user-management/:path*",
-    "/qr-management/:path*",
+    "/lp/:path*",
+    "/store/:path*",
+    "/audit/:path*",
+    "/notifications/:path*",
   ],
 };

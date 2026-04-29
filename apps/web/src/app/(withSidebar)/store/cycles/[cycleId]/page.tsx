@@ -10,6 +10,8 @@ import {
   type StatementTaskStatus,
 } from "@vendorstream/database";
 import { authOptions } from "@/app/api/auth/[...nextauth]/options";
+import { PageErrorState } from "@/components/page-error-state";
+import { formatMonthLabel } from "@/lib/format";
 import { getStoreUploadContextForUser } from "@/lib/store-upload-context";
 import {
   Card,
@@ -123,10 +125,7 @@ const VALIDATING_BATCH_STATUSES: ImportBatchStatus[] = [
 ];
 
 function formatMonth(date: Date) {
-  return new Intl.DateTimeFormat("en-US", {
-    month: "long",
-    year: "numeric",
-  }).format(date);
+  return formatMonthLabel(date);
 }
 
 function formatDateTime(date: Date | null) {
@@ -730,77 +729,6 @@ async function getStoreCycleDetailsState(
   }
 }
 
-function MissingState({ cycleId }: { cycleId: string }) {
-  return (
-    <Card className="border border-amber-400/20 bg-amber-500/8 shadow-2xl backdrop-blur-xl">
-      <CardHeader className="space-y-3">
-        <div className="inline-flex w-fit items-center rounded-full border border-amber-400/30 bg-amber-500/10 px-3 py-1 text-xs font-medium uppercase tracking-[0.18em] text-amber-100">
-          Cycle not found
-        </div>
-        <CardTitle className="text-2xl text-white">
-          No store reconciliation cycle matched this identifier
-        </CardTitle>
-        <CardDescription className="text-sm leading-6 text-amber-100/90">
-          The cycle ID <span className="font-medium text-white">{cycleId}</span>{" "}
-          is not available in the current store workspace.
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="flex flex-wrap gap-3">
-        <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
-          <Link href="/store/cycles">Back to store cycles</Link>
-        </Button>
-      </CardContent>
-    </Card>
-  );
-}
-
-function ForbiddenState() {
-  return (
-    <Card className="border border-red-400/20 bg-red-500/8 shadow-2xl backdrop-blur-xl">
-      <CardHeader className="space-y-3">
-        <div className="inline-flex w-fit items-center rounded-full border border-red-400/30 bg-red-500/10 px-3 py-1 text-xs font-medium uppercase tracking-[0.18em] text-red-100">
-          Access restricted
-        </div>
-        <CardTitle className="text-2xl text-white">
-          You do not have access to this cycle
-        </CardTitle>
-        <CardDescription className="text-sm leading-6 text-red-100/90">
-          This reconciliation cycle does not belong to a store location in your
-          current access scope.
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="flex flex-wrap gap-3">
-        <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
-          <Link href="/store/cycles">Back to store cycles</Link>
-        </Button>
-      </CardContent>
-    </Card>
-  );
-}
-
-function ErrorState({ message }: { message: string }) {
-  return (
-    <Card className="border border-red-400/20 bg-red-500/8 shadow-2xl backdrop-blur-xl">
-      <CardHeader className="space-y-3">
-        <div className="inline-flex w-fit items-center rounded-full border border-red-400/30 bg-red-500/10 px-3 py-1 text-xs font-medium uppercase tracking-[0.18em] text-red-100">
-          Cycle unavailable
-        </div>
-        <CardTitle className="text-2xl text-white">
-          Store reconciliation cycle details could not be loaded
-        </CardTitle>
-        <CardDescription className="text-sm leading-6 text-red-100/90">
-          {message}
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="flex flex-wrap gap-3">
-        <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
-          <Link href="/store/cycles">Back to store cycles</Link>
-        </Button>
-      </CardContent>
-    </Card>
-  );
-}
-
 export default async function StoreCycleDetailsPage({
   params,
 }: {
@@ -827,9 +755,49 @@ export default async function StoreCycleDetailsPage({
           </div>
         </header>
 
-        {state.kind === "missing" ? <MissingState cycleId={state.cycleId} /> : null}
-        {state.kind === "forbidden" ? <ForbiddenState /> : null}
-        {state.kind === "error" ? <ErrorState message={state.message} /> : null}
+        {state.kind === "missing" ? (
+          <PageErrorState
+            variant="missing"
+            badgeLabel="Cycle not found"
+            title="No store reconciliation cycle matched this identifier"
+            description={
+              <>
+                The cycle ID <span className="font-medium text-white">{state.cycleId}</span>{" "}
+                is not available in the current store workspace.
+              </>
+            }
+            actions={
+              <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
+                <Link href="/store/cycles">Back to store cycles</Link>
+              </Button>
+            }
+          />
+        ) : null}
+        {state.kind === "forbidden" ? (
+          <PageErrorState
+            variant="forbidden"
+            title="You do not have access to this cycle"
+            description="This reconciliation cycle does not belong to a store location in your current access scope."
+            actions={
+              <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
+                <Link href="/store/cycles">Back to store cycles</Link>
+              </Button>
+            }
+          />
+        ) : null}
+        {state.kind === "error" ? (
+          <PageErrorState
+            variant="error"
+            badgeLabel="Cycle unavailable"
+            title="Store reconciliation cycle details could not be loaded"
+            description={state.message}
+            actions={
+              <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
+                <Link href="/store/cycles">Back to store cycles</Link>
+              </Button>
+            }
+          />
+        ) : null}
 
         {state.kind === "ready" ? (
           <div className="space-y-6">

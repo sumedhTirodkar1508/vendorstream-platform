@@ -9,6 +9,11 @@ export type DashboardShellUser = {
   name: string;
   email: string;
   systemRole?: "USER" | "ADMIN" | "FINANCE_VIEWER";
+  defaultHomeHref: string;
+  hasAdminAccess: boolean;
+  hasLpAccess: boolean;
+  hasStoreAccess: boolean;
+  hasOperationsAccess: boolean;
 };
 
 type DashboardShellProps = {

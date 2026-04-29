@@ -1,16 +1,10 @@
 import { PrismaClient } from "@prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { Pool } from "pg";
-import dotenv from "dotenv";
-import path from "path";
-
-// Load root .env manually
-dotenv.config({
-  path: path.resolve(process.cwd(), "../../.env"),
-});
 
 export { PrismaClient, Prisma, $Enums } from "@prisma/client";
 export type * from "@prisma/client";
+export { recordAuditLog } from "./audit-log";
 
 const globalForPrisma = globalThis as unknown as {
   prisma?: PrismaClient;

@@ -1,16 +1,21 @@
-import { getServerSession } from "next-auth";
-import { redirect } from "next/navigation";
-import { authOptions } from "@/app/api/auth/[...nextauth]/options";
 import {
   DashboardShell,
   type DashboardShellUser,
 } from "@/components/dashboard-shell";
+import { getAccessSnapshot } from "@/lib/authz";
 
-function getShellUser(sessionUser: any): DashboardShellUser {
+function getShellUser(
+  access: Awaited<ReturnType<typeof getAccessSnapshot>>,
+): DashboardShellUser {
   return {
-    name: sessionUser?.name?.trim() || "VendorStream User",
-    email: sessionUser?.email?.trim() || "unknown@vendorstream.local",
-    systemRole: sessionUser?.systemRole,
+    name: access.user.name,
+    email: access.user.email,
+    systemRole: access.user.systemRole,
+    defaultHomeHref: access.defaultHomeHref,
+    hasAdminAccess: access.hasAdminAccess,
+    hasLpAccess: access.hasLpAccess,
+    hasStoreAccess: access.hasStoreAccess,
+    hasOperationsAccess: access.hasOperationsAccess,
   };
 }
 
@@ -19,14 +24,10 @@ export default async function WithSidebarLayout({
 }: {
   children: React.ReactNode;
 }) {
-  const session = await getServerSession(authOptions);
-
-  if (!session?.user) {
-    redirect("/login");
-  }
+  const access = await getAccessSnapshot();
 
   return (
-    <DashboardShell user={getShellUser(session.user)}>
+    <DashboardShell user={getShellUser(access)}>
       {children}
     </DashboardShell>
   );

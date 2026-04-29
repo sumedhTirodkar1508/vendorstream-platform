@@ -3,6 +3,7 @@ import { getServerSession } from "next-auth";
 import { redirect } from "next/navigation";
 import { prisma, type $Enums } from "@vendorstream/database";
 import { authOptions } from "@/app/api/auth/[...nextauth]/options";
+import { formatMonthLabel } from "@/lib/format";
 import { getStoreUploadContextForUser } from "@/lib/store-upload-context";
 import {
   Card,
@@ -120,10 +121,7 @@ const FAILED_BATCH_STATUSES: ImportBatchStatus[] = [
 ];
 
 function formatMonth(date: Date) {
-  return new Intl.DateTimeFormat("en-US", {
-    month: "long",
-    year: "numeric",
-  }).format(date);
+  return formatMonthLabel(date);
 }
 
 function formatDateTime(date: Date | null) {
@@ -453,7 +451,7 @@ async function getStoreUploadsPageState(searchParams?: {
       }),
     ]);
 
-    const mappedRows: UploadRow[] = rows.map((row: any) => ({
+    const mappedRows: UploadRow[] = rows.map((row) => ({
       id: row.id,
       month: row.cycle.periodMonth,
       lpName: row.cycle.lp.name,

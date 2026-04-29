@@ -1,8 +1,12 @@
 import Link from "next/link";
 import { getServerSession } from "next-auth";
 import { redirect } from "next/navigation";
+import { revalidatePath } from "next/cache";
 import { prisma, type Prisma, type $Enums } from "@vendorstream/database";
 import { authOptions } from "@/app/api/auth/[...nextauth]/options";
+import { MismatchResolutionForm } from "@/components/mismatch-resolution-form";
+import { formatMonthLabel } from "@/lib/format";
+import { resolveMismatch } from "@/lib/mismatch-resolution-server";
 import { getStoreUploadContextForUser } from "@/lib/store-upload-context";
 import {
   Card,
@@ -64,6 +68,7 @@ type StoreCycleMismatchState =
       counts: Record<ReviewTab, number>;
       rows: MismatchRow[];
       selectedMismatch: MismatchRow | null;
+      canManageResolutions: boolean;
     }
   | {
       kind: "empty";
@@ -79,6 +84,7 @@ type StoreCycleMismatchState =
       activeType: string;
       typeOptions: MismatchType[];
       counts: Record<ReviewTab, number>;
+      canManageResolutions: boolean;
     }
   | {
       kind: "missing";
@@ -119,10 +125,7 @@ function isMismatchType(value: string | undefined): value is MismatchType {
 }
 
 function formatMonth(date: Date) {
-  return new Intl.DateTimeFormat("en-US", {
-    month: "long",
-    year: "numeric",
-  }).format(date);
+  return formatMonthLabel(date);
 }
 
 function formatDateTime(date: Date | null) {
@@ -173,6 +176,166 @@ function buildMismatchHref(
   }
 
   return `/store/cycles/${cycleId}/mismatches?${params.toString()}`;
+}
+
+function getMutationBanner(mutation: string | undefined) {
+  if (mutation === "resolved_accept_lp") {
+    return {
+      tone: "success" as const,
+      message: "Mismatch resolved with Accept LP.",
+    };
+  }
+
+  if (mutation === "resolved_accept_store") {
+    return {
+      tone: "success" as const,
+      message: "Mismatch resolved with Accept store.",
+    };
+  }
+
+  if (mutation === "resolved_manual_override") {
+    return {
+      tone: "success" as const,
+      message: "Manual override recorded and mismatch marked resolved.",
+    };
+  }
+
+  if (mutation === "waived") {
+    return {
+      tone: "success" as const,
+      message: "Mismatch waived successfully.",
+    };
+  }
+
+  if (mutation === "commented") {
+    return {
+      tone: "success" as const,
+      message: "Comment recorded successfully.",
+    };
+  }
+
+  if (mutation === "invalid") {
+    return {
+      tone: "warning" as const,
+      message:
+        "The submitted mismatch resolution was invalid. Check the action, comment, and payload fields.",
+    };
+  }
+
+  if (mutation === "invalid_payload") {
+    return {
+      tone: "warning" as const,
+      message: "Manual override payload must be valid JSON.",
+    };
+  }
+
+  if (mutation === "forbidden") {
+    return {
+      tone: "warning" as const,
+      message:
+        "You are not authorized to resolve mismatches in this store workspace.",
+    };
+  }
+
+  if (mutation === "not_found") {
+    return {
+      tone: "warning" as const,
+      message: "The selected mismatch could not be found.",
+    };
+  }
+
+  if (mutation === "already_closed") {
+    return {
+      tone: "warning" as const,
+      message:
+        "This mismatch is already closed. Only comment-only entries can be added now.",
+    };
+  }
+
+  if (mutation === "error") {
+    return {
+      tone: "warning" as const,
+      message: "Mismatch resolution could not be completed. Try again shortly.",
+    };
+  }
+
+  return null;
+}
+
+async function submitStoreMismatchResolution(formData: FormData) {
+  "use server";
+
+  const session = await getServerSession(authOptions);
+
+  if (!session?.user) {
+    redirect("/login");
+  }
+
+  const cycleId = String(formData.get("cycleId") || "").trim();
+  const currentView = normalizeTab(String(formData.get("currentView") || "").trim());
+  const currentType = String(formData.get("currentType") || "").trim();
+  const mismatchId = String(formData.get("mismatchId") || "").trim();
+  const resolutionAction = String(formData.get("resolutionAction") || "").trim();
+  const comment = String(formData.get("comment") || "");
+  const payloadJson = String(formData.get("payloadJson") || "");
+
+  const fallbackHref = buildMismatchHref(
+    cycleId,
+    currentView,
+    currentType || undefined,
+    mismatchId || undefined,
+  );
+
+  if (!session.user.id || !cycleId || !mismatchId) {
+    redirect(`${fallbackHref}&mutation=invalid`);
+  }
+
+  const result = await resolveMismatch({
+    mismatchId,
+    action: resolutionAction as $Enums.ResolutionAction,
+    actor: {
+      userId: session.user.id,
+      systemRole: session.user.systemRole,
+    },
+    workspace: "STORE",
+    comment,
+    payloadJson,
+  });
+
+  if (result.status !== "success") {
+    const href = buildMismatchHref(
+      result.cycleId ?? cycleId,
+      currentView,
+      currentType || undefined,
+      result.mismatchId ?? mismatchId,
+    );
+
+    redirect(`${href}&mutation=${result.status}`);
+  }
+
+  revalidatePath("/dashboard");
+  revalidatePath("/store/cycles");
+  revalidatePath(`/store/cycles/${result.cycleId}`);
+  revalidatePath(`/store/cycles/${result.cycleId}/mismatches`);
+
+  redirect(
+    `${buildMismatchHref(
+      result.cycleId,
+      result.nextTab,
+      currentType || undefined,
+      result.mismatchId,
+    )}&mutation=${
+      result.action === "WAIVE"
+        ? "waived"
+        : result.action === "COMMENT_ONLY"
+          ? "commented"
+          : result.action === "MANUAL_OVERRIDE"
+            ? "resolved_manual_override"
+            : result.action === "ACCEPT_LP"
+              ? "resolved_accept_lp"
+              : "resolved_accept_store"
+    }`,
+  );
 }
 
 function getStatusTone(status: MismatchStatus) {
@@ -266,6 +429,7 @@ async function getStoreCycleMismatchState(
     view?: string;
     type?: string;
     mismatchId?: string;
+    mutation?: string;
   },
 ): Promise<StoreCycleMismatchState> {
   const session = await getServerSession(authOptions);
@@ -295,7 +459,7 @@ async function getStoreCycleMismatchState(
       ),
     );
 
-    const cycle: any = await prisma.reconciliationCycle.findUnique({
+    const cycle = await prisma.reconciliationCycle.findUnique({
       where: { id: cycleId },
       select: {
         id: true,
@@ -313,6 +477,7 @@ async function getStoreCycleMismatchState(
             name: true,
             storeOrganization: {
               select: {
+                id: true,
                 name: true,
               },
             },
@@ -383,6 +548,19 @@ async function getStoreCycleMismatchState(
 
     const isAdmin = session.user.systemRole === "ADMIN";
     const pairKey = `${cycle.lpId}:${cycle.storeLocationId}`;
+    const membership = await prisma.storeOrgMembership.findFirst({
+      where: {
+        userId: session.user.id,
+        storeOrganizationId: cycle.storeLocation.storeOrganization.id,
+      },
+      select: {
+        role: true,
+      },
+    });
+    const canManageResolutions =
+      isAdmin ||
+      membership?.role === "STORE_ORG_ADMIN" ||
+      membership?.role === "STORE_ORG_MANAGER";
 
     if (!isAdmin && !allowedPairs.has(pairKey)) {
       return { kind: "forbidden" };
@@ -400,17 +578,17 @@ async function getStoreCycleMismatchState(
 
     const counts: Record<ReviewTab, number> = {
       open:
-        countsQuery.find((entry: any) => entry.status === "OPEN")?._count
+        countsQuery.find((entry) => entry.status === "OPEN")?._count
           ._all ?? 0,
       resolved:
-        countsQuery.find((entry: any) => entry.status === "RESOLVED")?._count
+        countsQuery.find((entry) => entry.status === "RESOLVED")?._count
           ._all ?? 0,
       waived:
-        countsQuery.find((entry: any) => entry.status === "WAIVED")?._count
+        countsQuery.find((entry) => entry.status === "WAIVED")?._count
           ._all ?? 0,
     };
 
-    const rows: MismatchRow[] = cycle.mismatches.map((mismatch: any) => {
+    const rows: MismatchRow[] = cycle.mismatches.map((mismatch) => {
       const latestResolution = mismatch.resolutions[0] ?? null;
       const identity = getBarcodeAndProduct(mismatch);
 
@@ -438,7 +616,7 @@ async function getStoreCycleMismatchState(
                 "Unknown user",
             }
           : null,
-        resolutions: mismatch.resolutions.map((resolution: any) => ({
+        resolutions: mismatch.resolutions.map((resolution) => ({
           id: resolution.id,
           action: resolution.action,
           comment: resolution.comment,
@@ -472,6 +650,7 @@ async function getStoreCycleMismatchState(
         activeType,
         typeOptions: TYPE_OPTIONS,
         counts,
+        canManageResolutions,
       };
     }
 
@@ -491,6 +670,7 @@ async function getStoreCycleMismatchState(
       counts,
       rows,
       selectedMismatch,
+      canManageResolutions,
     };
   } catch (error) {
     console.error("Failed to load store cycle mismatches", error);
@@ -695,11 +875,13 @@ export default async function StoreCycleMismatchesPage({
     view?: string;
     type?: string;
     mismatchId?: string;
+    mutation?: string;
   }>;
 }) {
   const { cycleId } = await params;
   const resolvedSearchParams = searchParams ? await searchParams : undefined;
   const state = await getStoreCycleMismatchState(cycleId, resolvedSearchParams);
+  const mutationBanner = getMutationBanner(resolvedSearchParams?.mutation);
 
   return (
     <main className="relative min-h-screen overflow-hidden text-white">
@@ -719,6 +901,18 @@ export default async function StoreCycleMismatchesPage({
           </div>
         </header>
 
+        {mutationBanner ? (
+          <div
+            className={`rounded-2xl border px-4 py-4 text-sm leading-6 ${
+              mutationBanner.tone === "success"
+                ? "border-emerald-400/20 bg-emerald-500/10 text-emerald-100"
+                : "border-amber-400/20 bg-amber-500/10 text-amber-100"
+            }`}
+          >
+            {mutationBanner.message}
+          </div>
+        ) : null}
+
         {state.kind === "missing" ? (
           <MissingState cycleId={state.cycleId} />
         ) : null}
@@ -733,6 +927,7 @@ export default async function StoreCycleMismatchesPage({
             activeType={state.activeType}
             typeOptions={state.typeOptions}
             counts={state.counts}
+            canManageResolutions={state.canManageResolutions}
           />
         ) : null}
 
@@ -982,24 +1177,6 @@ export default async function StoreCycleMismatchesPage({
                               View details
                             </Link>
                           </Button>
-                          <Button
-                            type="button"
-                            size="sm"
-                            variant="ghost"
-                            disabled
-                            className="text-slate-300 disabled:text-slate-500"
-                          >
-                            Accept LP
-                          </Button>
-                          <Button
-                            type="button"
-                            size="sm"
-                            variant="ghost"
-                            disabled
-                            className="text-slate-300 disabled:text-slate-500"
-                          >
-                            Accept store
-                          </Button>
                         </div>
                       </div>
                     </div>
@@ -1102,51 +1279,17 @@ export default async function StoreCycleMismatchesPage({
                             ) || "No structured details available."}
                           </pre>
                         </div>
-                        <div className="grid gap-3 sm:grid-cols-2">
-                          <Button
-                            type="button"
-                            disabled
-                            className="bg-white text-slate-950 hover:bg-slate-100 disabled:bg-white/20 disabled:text-slate-400"
-                          >
-                            Accept LP
-                          </Button>
-                          <Button
-                            type="button"
-                            disabled
-                            className="bg-white text-slate-950 hover:bg-slate-100 disabled:bg-white/20 disabled:text-slate-400"
-                          >
-                            Accept store
-                          </Button>
-                          <Button
-                            type="button"
-                            variant="outline"
-                            disabled
-                            className="border-white/15 bg-white/5 text-white disabled:text-slate-500"
-                          >
-                            Manual override
-                          </Button>
-                          <Button
-                            type="button"
-                            variant="outline"
-                            disabled
-                            className="border-white/15 bg-white/5 text-white disabled:text-slate-500"
-                          >
-                            Waive
-                          </Button>
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            disabled
-                            className="text-slate-300 disabled:text-slate-500"
-                          >
-                            Comment
-                          </Button>
-                        </div>
-                        <div className="rounded-2xl border border-cyan-400/20 bg-cyan-400/10 px-4 py-4 text-sm leading-6 text-cyan-100">
-                          TODO: resolution actions will post real
-                          `MismatchResolution` records and update cycle state
-                          once the mutation layer is wired.
-                        </div>
+                        <MismatchResolutionForm
+                          mismatchId={state.selectedMismatch.id}
+                          mismatchStatus={state.selectedMismatch.status}
+                          canManage={state.canManageResolutions}
+                          action={submitStoreMismatchResolution}
+                          hiddenFields={{
+                            cycleId: state.cycle.id,
+                            currentView: state.activeTab,
+                            currentType: state.activeType,
+                          }}
+                        />
                       </>
                     ) : null}
                   </CardContent>

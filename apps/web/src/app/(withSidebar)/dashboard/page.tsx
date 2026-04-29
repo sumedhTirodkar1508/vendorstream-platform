@@ -1,5 +1,4 @@
 import Link from "next/link";
-import { getServerSession } from "next-auth";
 import { redirect } from "next/navigation";
 import {
   prisma,
@@ -7,7 +6,6 @@ import {
   type ImportBatchStatus,
   type StatementStatus,
 } from "@vendorstream/database";
-import { authOptions } from "@/app/api/auth/[...nextauth]/options";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -16,8 +14,8 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { getLpAccessContextForUser } from "@/lib/lp-access-context";
-import { getStoreUploadContextForUser } from "@/lib/store-upload-context";
+import { getAccessSnapshot } from "@/lib/authz";
+import { formatMonthLabel } from "@/lib/format";
 
 type DashboardSummary = {
   label:
@@ -81,10 +79,7 @@ const LP_UPLOAD_ATTENTION_STATUSES: ImportBatchStatus[] = [
 ];
 
 function formatMonth(date: Date) {
-  return new Intl.DateTimeFormat("en-US", {
-    month: "long",
-    year: "numeric",
-  }).format(date);
+  return formatMonthLabel(date);
 }
 
 function getRoleLabel(role?: "USER" | "ADMIN" | "FINANCE_VIEWER") {
@@ -279,37 +274,24 @@ function EmptyState({
 }
 
 async function getDashboardState(): Promise<LpDashboardState> {
-  const session = await getServerSession(authOptions);
+  const access = await getAccessSnapshot();
+  const userName = access.user.name;
 
-  if (!session?.user) {
-    redirect("/login");
-  }
-
-  if (!session.user.id) {
-    redirect("/login");
-  }
-
-  const userName = session.user.name?.trim() || "VendorStream User";
-
-  if (session.user.systemRole === "ADMIN") {
+  if (access.hasAdminAccess) {
     redirect("/admin/dashboard");
   }
 
   try {
-    const [lpContext, storeContext] = await Promise.all([
-      getLpAccessContextForUser({
-        userId: session.user.id,
-        systemRole: session.user.systemRole,
-      }),
-      getStoreUploadContextForUser({
-        userId: session.user.id,
-        systemRole: session.user.systemRole,
-      }),
-    ]);
+    const lpContext = access.lpContext;
+    const storeContext = access.storeContext;
 
     if (lpContext.lpIds.length === 0) {
       if (storeContext.options.length > 0) {
         redirect("/store/dashboard");
+      }
+
+      if (access.hasOperationsAccess) {
+        redirect("/audit");
       }
 
       return {
@@ -486,14 +468,9 @@ async function getDashboardState(): Promise<LpDashboardState> {
 }
 
 export default async function DashboardPage() {
-  const session = await getServerSession(authOptions);
-
-  if (!session?.user) {
-    redirect("/login");
-  }
-
+  const access = await getAccessSnapshot();
   const state = await getDashboardState();
-  const roleLabel = getRoleLabel(session.user.systemRole);
+  const roleLabel = getRoleLabel(access.user.systemRole);
 
   return (
     <main className="relative min-h-screen overflow-hidden text-white">

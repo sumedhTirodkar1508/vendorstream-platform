@@ -16,6 +16,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { formatMonthLabel } from "@/lib/format";
 
 type DashboardSummary = {
   label:
@@ -83,10 +84,7 @@ const ACTIVE_CYCLE_STATUSES: CycleStatus[] = [
 ];
 
 function formatMonth(date: Date) {
-  return new Intl.DateTimeFormat("en-US", {
-    month: "long",
-    year: "numeric",
-  }).format(date);
+  return formatMonthLabel(date);
 }
 
 function formatDateTime(date: Date | null) {

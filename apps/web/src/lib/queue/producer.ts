@@ -2,24 +2,40 @@ import "server-only";
 
 import { PgBoss } from "pg-boss";
 import {
+  GenerateStatementSchema,
+  type GenerateStatementPayload,
   JOBS,
   ProcessImportBatchSchema,
   type ProcessImportBatchPayload,
+  ReconcileCycleSchema,
+  type ReconcileCyclePayload,
 } from "@vendorstream/contracts";
 
-type QueueEnqueueResult =
+type QueueEnqueueResult<TJobName extends (typeof JOBS)[keyof typeof JOBS]> =
   | {
       status: "ENQUEUED";
       jobId: string;
       error: null;
-      jobName: typeof JOBS.PROCESS_IMPORT_BATCH;
+      jobName: TJobName;
     }
   | {
       status: "FAILED" | "SKIPPED";
       jobId: null;
       error: string;
-      jobName: typeof JOBS.PROCESS_IMPORT_BATCH;
+      jobName: TJobName;
     };
+
+type ProcessImportBatchQueueEnqueueResult = QueueEnqueueResult<
+  typeof JOBS.PROCESS_IMPORT_BATCH
+>;
+
+type ReconcileCycleQueueEnqueueResult = QueueEnqueueResult<
+  typeof JOBS.RECONCILE_CYCLE
+>;
+
+type GenerateStatementQueueEnqueueResult = QueueEnqueueResult<
+  typeof JOBS.GENERATE_STATEMENT
+>;
 
 const globalForPgBoss = globalThis as unknown as {
   vendorStreamPgBoss?: Promise<PgBoss | null>;
@@ -76,6 +92,8 @@ async function createProducer() {
 
   await boss.start();
   await boss.createQueue(JOBS.PROCESS_IMPORT_BATCH);
+  await boss.createQueue(JOBS.RECONCILE_CYCLE);
+  await boss.createQueue(JOBS.GENERATE_STATEMENT);
 
   if (!globalForPgBoss.vendorStreamPgBossShutdownRegistered) {
     globalForPgBoss.vendorStreamPgBossShutdownRegistered = true;
@@ -120,7 +138,7 @@ async function getProducer() {
 
 export async function enqueueProcessImportBatchJob(
   payload: ProcessImportBatchPayload,
-): Promise<QueueEnqueueResult> {
+): Promise<ProcessImportBatchQueueEnqueueResult> {
   const parsedPayload = ProcessImportBatchSchema.parse(payload);
 
   if (!isQueueEnabled()) {
@@ -156,7 +174,8 @@ export async function enqueueProcessImportBatchJob(
       return {
         status: "FAILED",
         jobId: null,
-        error: "pg-boss did not return a job id for the import batch enqueue request.",
+        error:
+          "pg-boss did not return a job id for the import batch enqueue request.",
         jobName: JOBS.PROCESS_IMPORT_BATCH,
       };
     }
@@ -176,6 +195,132 @@ export async function enqueueProcessImportBatchJob(
           ? error.message
           : "The import batch job could not be enqueued.",
       jobName: JOBS.PROCESS_IMPORT_BATCH,
+    };
+  }
+}
+
+export async function enqueueGenerateStatementJob(
+  payload: GenerateStatementPayload,
+): Promise<GenerateStatementQueueEnqueueResult> {
+  const parsedPayload = GenerateStatementSchema.parse(payload);
+
+  if (!isQueueEnabled()) {
+    return {
+      status: "SKIPPED",
+      jobId: null,
+      error: "Queue enqueueing is disabled via PG_BOSS_ENABLED=false.",
+      jobName: JOBS.GENERATE_STATEMENT,
+    };
+  }
+
+  try {
+    const boss = await getProducer();
+
+    if (!boss) {
+      return {
+        status: "SKIPPED",
+        jobId: null,
+        error: "Queue producer is not available.",
+        jobName: JOBS.GENERATE_STATEMENT,
+      };
+    }
+
+    const jobId = await boss.send(JOBS.GENERATE_STATEMENT, parsedPayload, {
+      retryLimit: 8,
+      retryDelay: 30,
+      retryBackoff: true,
+      retentionSeconds: 60 * 60 * 24 * 14,
+      expireInSeconds: 60 * 60,
+    });
+
+    if (!jobId) {
+      return {
+        status: "FAILED",
+        jobId: null,
+        error:
+          "pg-boss did not return a job id for the generate statement enqueue request.",
+        jobName: JOBS.GENERATE_STATEMENT,
+      };
+    }
+
+    return {
+      status: "ENQUEUED",
+      jobId,
+      error: null,
+      jobName: JOBS.GENERATE_STATEMENT,
+    };
+  } catch (error) {
+    return {
+      status: "FAILED",
+      jobId: null,
+      error:
+        error instanceof Error
+          ? error.message
+          : "The generate statement job could not be enqueued.",
+      jobName: JOBS.GENERATE_STATEMENT,
+    };
+  }
+}
+
+export async function enqueueReconcileCycleJob(
+  payload: ReconcileCyclePayload,
+): Promise<ReconcileCycleQueueEnqueueResult> {
+  const parsedPayload = ReconcileCycleSchema.parse(payload);
+
+  if (!isQueueEnabled()) {
+    return {
+      status: "SKIPPED",
+      jobId: null,
+      error: "Queue enqueueing is disabled via PG_BOSS_ENABLED=false.",
+      jobName: JOBS.RECONCILE_CYCLE,
+    };
+  }
+
+  try {
+    const boss = await getProducer();
+
+    if (!boss) {
+      return {
+        status: "SKIPPED",
+        jobId: null,
+        error: "Queue producer is not available.",
+        jobName: JOBS.RECONCILE_CYCLE,
+      };
+    }
+
+    const jobId = await boss.send(JOBS.RECONCILE_CYCLE, parsedPayload, {
+      retryLimit: 8,
+      retryDelay: 30,
+      retryBackoff: true,
+      retentionSeconds: 60 * 60 * 24 * 14,
+      expireInSeconds: 60 * 60,
+    });
+
+    if (!jobId) {
+      return {
+        status: "FAILED",
+        jobId: null,
+        error:
+          "pg-boss did not return a job id for the reconcile cycle enqueue request.",
+        jobName: JOBS.RECONCILE_CYCLE,
+      };
+    }
+
+    return {
+      status: "ENQUEUED",
+      jobId,
+      error: null,
+      jobName: JOBS.RECONCILE_CYCLE,
+    };
+  } catch (error) {
+    return {
+      status: "FAILED",
+      jobId: null,
+      error:
+        error instanceof Error
+          ? error.message
+          : "The reconcile cycle job could not be enqueued.",
+      jobName: JOBS.RECONCILE_CYCLE,
     };
   }
 }

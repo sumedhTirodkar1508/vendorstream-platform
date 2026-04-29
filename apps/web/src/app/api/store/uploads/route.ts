@@ -2,8 +2,22 @@ import { randomUUID } from "node:crypto";
 import { getServerSession } from "next-auth";
 import { NextResponse } from "next/server";
 import { prisma } from "@vendorstream/database";
+import type { ProcessImportBatchPayload } from "@vendorstream/contracts";
 import { authOptions } from "@/app/api/auth/[...nextauth]/options";
-import { getStoreUploadContextForUser } from "@/lib/store-upload-context";
+import {
+  resolveAuthorizedUploadScope,
+  getSupabaseServiceRoleClient,
+} from "@/lib/import-upload-server";
+import { enqueueProcessImportBatchJob } from "@/lib/queue/producer";
+import {
+  DEFAULT_IMPORT_UPLOAD_BUCKET,
+  buildImportUploadStoragePath,
+  getCycleStatusForCurrentBatchPresence,
+  isAcceptedImportUploadFileName,
+  isValidUploadMonth,
+  parseUploadMonth,
+  MAX_IMPORT_UPLOAD_FILE_SIZE_BYTES,
+} from "@/lib/import-upload";
 
 type ApiSuccess = {
   ok: true;
@@ -12,6 +26,12 @@ type ApiSuccess = {
   importBatchId: string;
   cycleId: string;
   processingState: "RECEIVED";
+  queue: {
+    jobName: string;
+    status: "ENQUEUED" | "FAILED" | "SKIPPED";
+    jobId: string | null;
+    error: string | null;
+  };
 };
 
 type ApiError = {
@@ -19,8 +39,14 @@ type ApiError = {
   error: string;
 };
 
-const ACCEPTED_FILE_EXTENSIONS = [".xlsx", ".xls", ".xlsm"];
-const MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024;
+const BAD_REQUEST_MESSAGES = new Set([
+  "LP selection is required.",
+  "Store location selection is required.",
+  "A valid reporting month is required.",
+  "An Excel file is required.",
+  "Unsupported file type.",
+  "File exceeds the maximum allowed size.",
+]);
 
 function successResponse(payload: ApiSuccess, status = 202) {
   return NextResponse.json<ApiSuccess>(payload, { status });
@@ -36,24 +62,43 @@ function errorResponse(message: string, status: number) {
   );
 }
 
-function isValidMonth(value: string) {
-  return /^\d{4}-\d{2}$/.test(value);
+function getErrorStatus(message: string) {
+  if (BAD_REQUEST_MESSAGES.has(message)) {
+    return 400;
+  }
+
+  if (
+    message.includes("current access scope") ||
+    message.includes("actively assigned")
+  ) {
+    return 403;
+  }
+
+  return 500;
 }
 
-function parseMonth(value: string) {
-  const [year, month] = value.split("-").map((part) => Number(part));
-  return new Date(Date.UTC(year, month - 1, 1, 0, 0, 0, 0));
-}
+async function cleanupStoredUpload(args: {
+  bucket: string;
+  storagePath: string;
+}) {
+  try {
+    const supabase = getSupabaseServiceRoleClient();
+    const removeResult = await supabase.storage
+      .from(args.bucket)
+      .remove([args.storagePath]);
 
-function isAcceptedFileName(value: string) {
-  const lowerValue = value.toLowerCase();
-  return ACCEPTED_FILE_EXTENSIONS.some((extension) =>
-    lowerValue.endsWith(extension),
-  );
-}
-
-function sanitizeFileName(value: string) {
-  return value.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/-+/g, "-");
+    if (removeResult.error) {
+      console.error(
+        "[api/store/uploads] failed to remove orphaned storage object",
+        removeResult.error,
+      );
+    }
+  } catch (cleanupError) {
+    console.error(
+      "[api/store/uploads] cleanup after transaction failure threw",
+      cleanupError,
+    );
+  }
 }
 
 export async function POST(request: Request) {
@@ -71,7 +116,9 @@ export async function POST(request: Request) {
     const formData = await request.formData();
 
     const lpId = String(formData.get("lpId") || "").trim();
-    const storeLocationId = String(formData.get("storeLocationId") || "").trim();
+    const storeLocationId = String(
+      formData.get("storeLocationId") || "",
+    ).trim();
     const month = String(formData.get("month") || "").trim();
     const file = formData.get("file");
 
@@ -83,7 +130,7 @@ export async function POST(request: Request) {
       return errorResponse("Store location selection is required.", 400);
     }
 
-    if (!isValidMonth(month)) {
+    if (!isValidUploadMonth(month)) {
       return errorResponse("A valid reporting month is required.", 400);
     }
 
@@ -91,122 +138,173 @@ export async function POST(request: Request) {
       return errorResponse("An Excel file is required.", 400);
     }
 
-    if (!isAcceptedFileName(file.name)) {
+    if (!isAcceptedImportUploadFileName(file.name)) {
       return errorResponse("Unsupported file type.", 400);
     }
 
-    if (file.size > MAX_FILE_SIZE_BYTES) {
+    if (file.size > MAX_IMPORT_UPLOAD_FILE_SIZE_BYTES) {
       return errorResponse("File exceeds the maximum allowed size.", 400);
     }
 
-    const uploadContext = await getStoreUploadContextForUser({
-      userId: session.user.id,
-      systemRole: session.user.systemRole,
+    await resolveAuthorizedUploadScope({
+      actor: {
+        userId: session.user.id,
+        systemRole: session.user.systemRole,
+      },
+      sourceType: "STORE",
+      lpId,
+      storeLocationId,
+      month,
     });
 
-    const authorizedOption =
-      uploadContext.options.find(
-        (option) =>
-          option.lpId === lpId && option.storeLocationId === storeLocationId,
-      ) ?? null;
+    const periodMonth = parseUploadMonth(month);
+    const bucket = DEFAULT_IMPORT_UPLOAD_BUCKET;
+    const storagePath = buildImportUploadStoragePath({
+      sourceType: "STORE",
+      lpId,
+      storeLocationId,
+      month,
+      fileName: file.name,
+      uniqueSuffix: randomUUID(),
+    });
 
-    if (!authorizedOption) {
-      return errorResponse(
-        "The selected LP and store location combination is not available in your current access scope.",
-        403,
-      );
+    const supabase = getSupabaseServiceRoleClient();
+    const fileBuffer = Buffer.from(await file.arrayBuffer());
+
+    const uploadResult = await supabase.storage
+      .from(bucket)
+      .upload(storagePath, fileBuffer, {
+        contentType:
+          file.type ||
+          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        upsert: false,
+      });
+
+    if (uploadResult.error) {
+      return errorResponse("Failed to upload file to storage.", 500);
     }
 
-    const periodMonth = parseMonth(month);
-
-    const result = await prisma.$transaction(async (tx) => {
-      const cycle = await tx.reconciliationCycle.upsert({
-        where: {
-          lpId_storeLocationId_periodMonth: {
+    const result = await prisma
+      .$transaction(async (tx) => {
+        const cycle = await tx.reconciliationCycle.upsert({
+          where: {
+            lpId_storeLocationId_periodMonth: {
+              lpId,
+              storeLocationId,
+              periodMonth,
+            },
+          },
+          update: {},
+          create: {
             lpId,
             storeLocationId,
             periodMonth,
+            status: "AWAITING_UPLOADS",
           },
-        },
-        update: {},
-        create: {
-          lpId,
-          storeLocationId,
-          periodMonth,
-          status: "AWAITING_UPLOADS",
-        },
-      });
+        });
 
-      await tx.importBatch.updateMany({
-        where: {
-          cycleId: cycle.id,
-          sourceType: "STORE",
-          isCurrent: true,
-        },
-        data: {
-          isCurrent: false,
-        },
-      });
-
-      const hasCurrentLpBatch =
-        (await tx.importBatch.count({
+        await tx.importBatch.updateMany({
           where: {
             cycleId: cycle.id,
-            sourceType: "LP",
+            sourceType: "STORE",
             isCurrent: true,
           },
-        })) > 0;
+          data: {
+            isCurrent: false,
+          },
+        });
 
-      const uploadedFile = await tx.uploadedFile.create({
-        data: {
-          fileKind: "STORE_UPLOAD",
-          bucket: "pending-store-uploads",
-          storagePath: `pending/store/${cycle.id}/${randomUUID()}-${sanitizeFileName(file.name)}`,
-          originalFilename: file.name,
-          mimeType: file.type || null,
-          sizeBytes: BigInt(file.size),
-          uploadedByUserId: session.user.id,
-        },
-      });
+        const hasCurrentLpBatch =
+          (await tx.importBatch.count({
+            where: {
+              cycleId: cycle.id,
+              sourceType: "LP",
+              isCurrent: true,
+            },
+          })) > 0;
 
-      const batch = await tx.importBatch.create({
-        data: {
+        const uploadedFile = await tx.uploadedFile.create({
+          data: {
+            fileKind: "STORE_UPLOAD",
+            bucket,
+            storagePath,
+            originalFilename: file.name,
+            mimeType: file.type || null,
+            sizeBytes: BigInt(file.size),
+            uploadedByUserId: session.user.id,
+          },
+        });
+
+        const batch = await tx.importBatch.create({
+          data: {
+            cycleId: cycle.id,
+            uploadedFileId: uploadedFile.id,
+            sourceType: "STORE",
+            status: "RECEIVED",
+            isCurrent: true,
+            uploadedByUserId: session.user.id,
+          },
+        });
+
+        const cycleStatus = getCycleStatusForCurrentBatchPresence({
+          hasCurrentLpBatch,
+          hasCurrentStoreBatch: true,
+        });
+
+        await tx.reconciliationCycle.update({
+          where: { id: cycle.id },
+          data: { status: cycleStatus },
+        });
+
+        return {
           cycleId: cycle.id,
+          cycleStatus,
           uploadedFileId: uploadedFile.id,
-          sourceType: "STORE",
-          status: "RECEIVED",
-          isCurrent: true,
-          uploadedByUserId: session.user.id,
-        },
+          importBatchId: batch.id,
+        };
+      })
+      .catch(async (transactionError) => {
+        await cleanupStoredUpload({ bucket, storagePath });
+        throw transactionError;
       });
 
-      await tx.reconciliationCycle.update({
-        where: { id: cycle.id },
-        data: {
-          status: hasCurrentLpBatch
-            ? "READY_FOR_RECONCILIATION"
-            : "AWAITING_UPLOADS",
-        },
-      });
+    const enqueuePayload: ProcessImportBatchPayload = {
+      importBatchId: result.importBatchId,
+      cycleId: result.cycleId,
+      uploadedFileId: result.uploadedFileId,
+      uploadedByUserId: session.user.id,
+      sourceType: "STORE",
+      lpId,
+      storeLocationId,
+      periodMonth: month,
+    };
 
-      return {
-        cycleId: cycle.id,
-        uploadedFileId: uploadedFile.id,
-        importBatchId: batch.id,
-      };
-    });
+    const queue = await enqueueProcessImportBatchJob(enqueuePayload);
 
     return successResponse({
       ok: true,
       message:
-        "Store upload accepted. VendorStream created the cycle linkage, uploaded file record, and current import batch. TODO: persist file bytes to storage and trigger background parsing next.",
+        queue.status === "ENQUEUED"
+          ? "Store upload accepted. File stored, records created, and processing job enqueued."
+          : "Store upload accepted. File stored and records created, but the processing job could not be queued automatically.",
       uploadedFileId: result.uploadedFileId,
       importBatchId: result.importBatchId,
       cycleId: result.cycleId,
       processingState: "RECEIVED",
+      queue: {
+        jobName: queue.jobName,
+        status: queue.status,
+        jobId: queue.jobId,
+        error: queue.error,
+      },
     });
   } catch (error) {
+    const message = error instanceof Error ? error.message : "";
+    const status = getErrorStatus(message);
     console.error("[api/store/uploads] failed", error);
-    return errorResponse("Failed to accept store upload.", 500);
+    return errorResponse(
+      status === 500 ? "Failed to accept store upload." : message,
+      status,
+    );
   }
 }

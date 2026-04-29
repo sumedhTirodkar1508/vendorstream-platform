@@ -3,6 +3,9 @@ import { getServerSession } from "next-auth";
 import { redirect } from "next/navigation";
 import { prisma, type $Enums, type Prisma } from "@vendorstream/database";
 import { authOptions } from "@/app/api/auth/[...nextauth]/options";
+import { PageErrorState } from "@/components/page-error-state";
+import { StatusBadge } from "@/components/ui/status-badge";
+import { BatchStatusPoller } from "@/components/batch-status-poller";
 import {
   Card,
   CardContent,
@@ -11,10 +14,25 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { retryImportBatchProcessingAction } from "@/app/(withSidebar)/actions/retry-processing";
+import { canRetryImportBatch } from "@/lib/processing-retry-rules";
+import {
+  formatDateTime,
+  formatEnumLabel,
+  formatFileSize,
+  formatMonthLabel,
+} from "@/lib/format";
+import {
+  getCycleStatusBadgeClassName,
+  getImportBatchStatusBadgeClassName,
+} from "@/lib/status-badges";
 
 type BatchSourceType = $Enums.BatchSourceType;
 type CycleStatus = $Enums.CycleStatus;
 type ImportBatchStatus = $Enums.ImportBatchStatus;
+type LpMembershipRole = $Enums.LpMembershipRole;
+
+const LP_MANAGEABLE_ROLES: LpMembershipRole[] = ["LP_ADMIN", "LP_MANAGER"];
 
 type BatchDetailsState =
   | {
@@ -53,6 +71,7 @@ type BatchDetailsState =
         validation: {
           preValidationErrors: Prisma.JsonValue | null;
           validationSummary: Prisma.JsonValue | null;
+          errorMessage: string | null;
         };
         cycle: {
           id: string;
@@ -63,6 +82,7 @@ type BatchDetailsState =
           periodMonth: Date;
           status: CycleStatus;
         };
+        canRetryBatch: boolean;
         timeline: Array<{
           id: string;
           label: string;
@@ -84,101 +104,23 @@ type BatchDetailsState =
       message: string;
     };
 
-function formatDateTime(value: Date | null) {
-  if (!value) {
-    return "Not available";
-  }
-
-  return new Intl.DateTimeFormat("en-US", {
-    month: "short",
-    day: "numeric",
-    year: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-  }).format(value);
-}
-
-function formatMonth(value: Date) {
-  return new Intl.DateTimeFormat("en-US", {
-    month: "long",
-    year: "numeric",
-  }).format(value);
-}
-
-function formatBytes(value: bigint) {
-  const asNumber =
-    value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : null;
-
-  if (asNumber === null) {
-    return `${value.toString()} bytes`;
-  }
-
-  if (asNumber >= 1024 * 1024 * 1024) {
-    return `${(asNumber / (1024 * 1024 * 1024)).toFixed(2)} GB`;
-  }
-
-  if (asNumber >= 1024 * 1024) {
-    return `${(asNumber / (1024 * 1024)).toFixed(2)} MB`;
-  }
-
-  if (asNumber >= 1024) {
-    return `${(asNumber / 1024).toFixed(1)} KB`;
-  }
-
-  return `${asNumber} bytes`;
-}
-
 function formatSourceType(value: BatchSourceType) {
   return value === "LP" ? "LP" : "Store";
 }
 
-function formatBatchStatus(value: ImportBatchStatus) {
-  return value.replaceAll("_", " ");
+function getJsonObject(value: Prisma.JsonValue | null) {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
 }
 
-function formatCycleStatus(value: CycleStatus) {
-  return value.replaceAll("_", " ");
-}
+function getValidationErrorMessage(value: Prisma.JsonValue | null) {
+  const object = getJsonObject(value);
+  const errorMessage = object?.errorMessage;
 
-function getBatchStatusTone(status: ImportBatchStatus) {
-  if (status === "RECONCILED") {
-    return "border-emerald-400/30 bg-emerald-500/10 text-emerald-100";
-  }
-
-  if (
-    status === "FAILED" ||
-    status === "VALIDATION_FAILED" ||
-    status === "PREVALIDATION_FAILED" ||
-    status === "CANCELED"
-  ) {
-    return "border-red-400/30 bg-red-500/10 text-red-100";
-  }
-
-  if (
-    status === "WAITING_FOR_COUNTERPART" ||
-    status === "RECEIVED" ||
-    status === "VALIDATING"
-  ) {
-    return "border-amber-400/30 bg-amber-500/10 text-amber-100";
-  }
-
-  return "border-white/10 bg-white/5 text-slate-200";
-}
-
-function getCycleStatusTone(status: CycleStatus) {
-  if (status === "STATEMENT_READY" || status === "RECONCILIATION_PASSED") {
-    return "border-emerald-400/30 bg-emerald-500/10 text-emerald-100";
-  }
-
-  if (status === "FAILED") {
-    return "border-red-400/30 bg-red-500/10 text-red-100";
-  }
-
-  if (status === "MISMATCHES_FOUND" || status === "AWAITING_UPLOADS") {
-    return "border-amber-400/30 bg-amber-500/10 text-amber-100";
-  }
-
-  return "border-white/10 bg-white/5 text-slate-200";
+  return typeof errorMessage === "string" && errorMessage.trim()
+    ? errorMessage
+    : null;
 }
 
 function JsonPanel({
@@ -228,22 +170,6 @@ function DetailRow({
   );
 }
 
-function StatusBadge({
-  label,
-  className,
-}: {
-  label: string;
-  className: string;
-}) {
-  return (
-    <span
-      className={`inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-medium ${className}`}
-    >
-      {label}
-    </span>
-  );
-}
-
 async function getBatchDetailsState(
   batchId: string,
 ): Promise<BatchDetailsState> {
@@ -275,7 +201,7 @@ async function getBatchDetailsState(
                     userId: session.user.id ?? "",
                   },
                   select: {
-                    id: true,
+                    role: true,
                   },
                 },
               },
@@ -311,6 +237,11 @@ async function getBatchDetailsState(
 
     const isAdmin = session.user.systemRole === "ADMIN";
     const hasLpMembership = batch.cycle.lp.memberships.length > 0;
+    const canManageBatchProcessing =
+      isAdmin ||
+      batch.cycle.lp.memberships.some((membership) =>
+        LP_MANAGEABLE_ROLES.includes(membership.role),
+      );
 
     if (!isAdmin && !hasLpMembership) {
       return { kind: "forbidden" };
@@ -369,6 +300,7 @@ async function getBatchDetailsState(
         validation: {
           preValidationErrors: batch.preValidationErrors,
           validationSummary: batch.validationSummary,
+          errorMessage: getValidationErrorMessage(batch.validationSummary),
         },
         cycle: {
           id: batch.cycle.id,
@@ -379,6 +311,9 @@ async function getBatchDetailsState(
           periodMonth: batch.cycle.periodMonth,
           status: batch.cycle.status,
         },
+        canRetryBatch:
+          canManageBatchProcessing &&
+          canRetryImportBatch(batch.status),
         timeline: [
           {
             id: "batch-created",
@@ -426,83 +361,16 @@ async function getBatchDetailsState(
   }
 }
 
-function MissingState({ batchId }: { batchId: string }) {
-  return (
-    <Card className="border border-amber-400/20 bg-amber-500/8 shadow-2xl backdrop-blur-xl">
-      <CardHeader className="space-y-3">
-        <div className="inline-flex w-fit items-center rounded-full border border-amber-400/30 bg-amber-500/10 px-3 py-1 text-xs font-medium uppercase tracking-[0.18em] text-amber-100">
-          Batch not found
-        </div>
-        <CardTitle className="text-2xl text-white">
-          No LP import batch matched this identifier
-        </CardTitle>
-        <CardDescription className="text-sm leading-6 text-amber-100/90">
-          The batch ID <span className="font-medium text-white">{batchId}</span>{" "}
-          is not available in the current LP workspace.
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="flex flex-wrap gap-3">
-        <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
-          <Link href="/lp/uploads">Back to LP uploads</Link>
-        </Button>
-      </CardContent>
-    </Card>
-  );
-}
-
-function ForbiddenState() {
-  return (
-    <Card className="border border-red-400/20 bg-red-500/8 shadow-2xl backdrop-blur-xl">
-      <CardHeader className="space-y-3">
-        <div className="inline-flex w-fit items-center rounded-full border border-red-400/30 bg-red-500/10 px-3 py-1 text-xs font-medium uppercase tracking-[0.18em] text-red-100">
-          Access restricted
-        </div>
-        <CardTitle className="text-2xl text-white">
-          You do not have access to this import batch
-        </CardTitle>
-        <CardDescription className="text-sm leading-6 text-red-100/90">
-          This batch does not belong to an LP context assigned to your account.
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="flex flex-wrap gap-3">
-        <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
-          <Link href="/lp/uploads">Back to LP uploads</Link>
-        </Button>
-      </CardContent>
-    </Card>
-  );
-}
-
-function ErrorState({ message }: { message: string }) {
-  return (
-    <Card className="border border-red-400/20 bg-red-500/8 shadow-2xl backdrop-blur-xl">
-      <CardHeader className="space-y-3">
-        <div className="inline-flex w-fit items-center rounded-full border border-red-400/30 bg-red-500/10 px-3 py-1 text-xs font-medium uppercase tracking-[0.18em] text-red-100">
-          Batch unavailable
-        </div>
-        <CardTitle className="text-2xl text-white">
-          LP import batch details could not be loaded
-        </CardTitle>
-        <CardDescription className="text-sm leading-6 text-red-100/90">
-          {message}
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="flex flex-wrap gap-3">
-        <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
-          <Link href="/lp/uploads">Back to LP uploads</Link>
-        </Button>
-      </CardContent>
-    </Card>
-  );
-}
-
 function ReadyState({
   batch,
+  returnTo,
 }: {
   batch: Extract<BatchDetailsState, { kind: "ready" }>["batch"];
+  returnTo: string;
 }) {
   return (
     <div className="space-y-6">
+      <BatchStatusPoller status={batch.status} />
       <div className="grid gap-4 lg:grid-cols-[1.25fr_0.75fr]">
         <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
           <CardHeader className="space-y-3">
@@ -515,8 +383,8 @@ function ReadyState({
                 className="border-white/10 bg-white/5 text-slate-200"
               />
               <StatusBadge
-                label={formatBatchStatus(batch.status)}
-                className={getBatchStatusTone(batch.status)}
+                label={formatEnumLabel(batch.status)}
+                className={getImportBatchStatusBadgeClassName(batch.status)}
               />
             </div>
             <div className="space-y-2">
@@ -575,14 +443,18 @@ function ReadyState({
                 Go to related cycle
               </Link>
             </Button>
-            <Button
-              type="button"
-              variant="outline"
-              disabled
-              className="border-white/15 bg-white/5 text-white disabled:text-slate-500"
-            >
-              Reprocess batch
-            </Button>
+            <form action={retryImportBatchProcessingAction}>
+              <input type="hidden" name="batchId" value={batch.id} />
+              <input type="hidden" name="returnTo" value={returnTo} />
+              <Button
+                type="submit"
+                variant="outline"
+                disabled={!batch.canRetryBatch}
+                className="w-full border-white/15 bg-white/5 text-white hover:bg-white/10 disabled:text-slate-500"
+              >
+                Reprocess batch
+              </Button>
+            </form>
             <Button
               type="button"
               variant="ghost"
@@ -611,7 +483,10 @@ function ReadyState({
               label="MIME type"
               value={batch.file.mimeType ?? "Not available"}
             />
-            <DetailRow label="Size" value={formatBytes(batch.file.sizeBytes)} />
+            <DetailRow
+              label="Size"
+              value={formatFileSize(batch.file.sizeBytes)}
+            />
             <DetailRow
               label="Checksum"
               value={batch.file.checksumSha256 ?? "Not available"}
@@ -658,6 +533,46 @@ function ReadyState({
         </Card>
       </div>
 
+      {batch.status === "VALIDATION_FAILED" ||
+      batch.status === "PREVALIDATION_FAILED" ? (
+        <Card className="border border-red-400/25 bg-red-500/10 shadow-2xl backdrop-blur-xl">
+          <CardHeader className="space-y-2">
+            <CardTitle className="text-xl text-white">
+              Validation failed
+            </CardTitle>
+            <CardDescription className="text-sm leading-6 text-red-100/90">
+              {batch.validation.errorMessage ??
+                "The workbook contains blocking validation errors."}
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="grid gap-3 sm:grid-cols-3">
+              <DetailRow
+                label="Total rows"
+                value={batch.processing.totalRows ?? "Not available"}
+              />
+              <DetailRow
+                label="Valid rows"
+                value={batch.processing.validRows ?? "Not available"}
+              />
+              <DetailRow
+                label="Invalid rows"
+                value={batch.processing.invalidRows ?? "Not available"}
+              />
+            </div>
+            <Button
+              asChild
+              variant="outline"
+              className="border-red-200/25 bg-white/5 text-white hover:bg-white/10"
+            >
+              <Link href={`/api/lp/uploads/${batch.id}/validation-errors`}>
+                Download failed-row CSV
+              </Link>
+            </Button>
+          </CardContent>
+        </Card>
+      ) : null}
+
       <div className="grid gap-4 xl:grid-cols-2">
         <JsonPanel
           title="Pre-validation errors"
@@ -695,14 +610,14 @@ function ReadyState({
           <DetailRow label="Store location" value={batch.cycle.storeLocation} />
           <DetailRow
             label="Period month"
-            value={formatMonth(batch.cycle.periodMonth)}
+            value={formatMonthLabel(batch.cycle.periodMonth)}
           />
           <DetailRow
             label="Cycle status"
             value={
               <StatusBadge
-                label={formatCycleStatus(batch.cycle.status)}
-                className={getCycleStatusTone(batch.cycle.status)}
+                label={formatEnumLabel(batch.cycle.status)}
+                className={getCycleStatusBadgeClassName(batch.cycle.status)}
               />
             }
           />
@@ -793,11 +708,61 @@ export default async function LpImportBatchDetailsPage({
         </header>
 
         {state.kind === "missing" ? (
-          <MissingState batchId={state.batchId} />
+          <PageErrorState
+            variant="missing"
+            badgeLabel="Batch not found"
+            title="No LP import batch matched this identifier"
+            description={
+              <>
+                The batch ID{" "}
+                <span className="font-medium text-white">{state.batchId}</span>{" "}
+                is not available in the current LP workspace.
+              </>
+            }
+            actions={
+              <Button
+                asChild
+                className="bg-white text-slate-950 hover:bg-slate-100"
+              >
+                <Link href="/lp/uploads">Back to LP uploads</Link>
+              </Button>
+            }
+          />
         ) : null}
-        {state.kind === "forbidden" ? <ForbiddenState /> : null}
-        {state.kind === "error" ? <ErrorState message={state.message} /> : null}
-        {state.kind === "ready" ? <ReadyState batch={state.batch} /> : null}
+        {state.kind === "forbidden" ? (
+          <PageErrorState
+            variant="forbidden"
+            title="You do not have access to this import batch"
+            description="This batch does not belong to an LP context assigned to your account."
+            actions={
+              <Button
+                asChild
+                className="bg-white text-slate-950 hover:bg-slate-100"
+              >
+                <Link href="/lp/uploads">Back to LP uploads</Link>
+              </Button>
+            }
+          />
+        ) : null}
+        {state.kind === "error" ? (
+          <PageErrorState
+            variant="error"
+            badgeLabel="Batch unavailable"
+            title="LP import batch details could not be loaded"
+            description={state.message}
+            actions={
+              <Button
+                asChild
+                className="bg-white text-slate-950 hover:bg-slate-100"
+              >
+                <Link href="/lp/uploads">Back to LP uploads</Link>
+              </Button>
+            }
+          />
+        ) : null}
+        {state.kind === "ready" ? (
+          <ReadyState batch={state.batch} returnTo={`/lp/uploads/${batchId}`} />
+        ) : null}
       </div>
     </main>
   );

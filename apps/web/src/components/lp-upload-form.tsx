@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useMemo, useRef, useState } from "react";
 import { runDirectImportUpload } from "@/lib/direct-upload-client";
 import {
@@ -8,6 +9,7 @@ import {
   MAX_IMPORT_UPLOAD_FILE_SIZE_BYTES,
   type UploadSourceType,
 } from "@/lib/import-upload";
+import { formatMonthLabel as sharedFormatMonthLabel } from "@/lib/format";
 import {
   Card,
   CardContent,
@@ -56,13 +58,7 @@ function formatMonthLabel(value: string) {
     return "Select month";
   }
 
-  const [year, month] = value.split("-");
-  const parsedDate = new Date(Number(year), Number(month) - 1, 1);
-
-  return new Intl.DateTimeFormat("en-US", {
-    month: "long",
-    year: "numeric",
-  }).format(parsedDate);
+  return sharedFormatMonthLabel(value);
 }
 
 function isMonthValue(value: string | undefined) {
@@ -82,6 +78,7 @@ export function LpUploadForm({
   initialValues,
   isAdminPreview = false,
 }: LpUploadFormProps) {
+  const router = useRouter();
   const initialOption =
     options.find(
       (option) =>
@@ -262,8 +259,9 @@ export function LpUploadForm({
         type: "success",
         text:
           payload.message ||
-          `LP upload completed for ${formatMonthLabel(month)}.`,
+          `LP upload queued for validation for ${formatMonthLabel(month)}.`,
       });
+      router.push(`/lp/uploads/${payload.importBatchId}`);
     } catch (error) {
       setUploadProgress(0);
       setNotice({
@@ -470,7 +468,7 @@ export function LpUploadForm({
                   {isUploading
                     ? `Uploading ${uploadProgress}%`
                     : uploadProgress === 100
-                      ? "Completed"
+                      ? "Queued for validation"
                       : "Waiting"}
                 </span>
               </div>
@@ -554,8 +552,8 @@ export function LpUploadForm({
               directly in Supabase Storage
             </div>
             <div className="rounded-xl border border-cyan-400/20 bg-cyan-400/10 px-4 py-3">
-              2. An `UploadedFile` record and current LP `ImportBatch` are
-              created after storage verification
+              2. An `UploadedFile` record and LP `ImportBatch` are created
+              after storage verification
             </div>
             <div className="rounded-xl border border-cyan-400/20 bg-cyan-400/10 px-4 py-3">
               3. The linked reconciliation cycle is created or refreshed and is

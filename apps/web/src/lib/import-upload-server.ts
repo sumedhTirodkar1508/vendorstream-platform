@@ -3,7 +3,7 @@ import "server-only";
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { JOBS, type ProcessImportBatchPayload } from "@vendorstream/contracts";
 import { createClient } from "@supabase/supabase-js";
-import { prisma, type SystemRole } from "@vendorstream/database";
+import { prisma, recordAuditLog, type SystemRole } from "@vendorstream/database";
 import { getLpAccessContextForUser } from "@/lib/lp-access-context";
 import {
   ACCEPTED_IMPORT_UPLOAD_FILE_EXTENSIONS,
@@ -24,7 +24,7 @@ import {
 import { enqueueProcessImportBatchJob } from "@/lib/queue/producer";
 import { getStoreUploadContextForUser } from "@/lib/store-upload-context";
 
-type UploadActor = {
+export type UploadActor = {
   userId: string;
   systemRole?: SystemRole;
 };
@@ -57,10 +57,13 @@ function getRequiredEnv(name: string) {
 }
 
 function getUploadIntentSecret() {
-  return process.env.UPLOAD_INTENT_SECRET?.trim() || getRequiredEnv("NEXTAUTH_SECRET");
+  return (
+    process.env.UPLOAD_INTENT_SECRET?.trim() ||
+    getRequiredEnv("NEXTAUTH_SECRET")
+  );
 }
 
-function getSupabaseServiceRoleClient() {
+export function getSupabaseServiceRoleClient() {
   return createClient(
     getRequiredEnv("NEXT_PUBLIC_SUPABASE_URL"),
     getRequiredEnv("SUPABASE_SERVICE_ROLE_KEY"),
@@ -74,7 +77,9 @@ function getSupabaseServiceRoleClient() {
 }
 
 function encodeUploadIntentToken(payload: UploadIntentPayload) {
-  const encodedPayload = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const encodedPayload = Buffer.from(JSON.stringify(payload)).toString(
+    "base64url",
+  );
   const signature = createHmac("sha256", getUploadIntentSecret())
     .update(encodedPayload)
     .digest("base64url");
@@ -158,7 +163,7 @@ function validateIntentInput(input: CreateImportUploadIntentRequest) {
   }
 }
 
-async function resolveAuthorizedUploadScope(args: {
+export async function resolveAuthorizedUploadScope(args: {
   actor: UploadActor;
   sourceType: UploadSourceType;
   lpId: string;
@@ -416,16 +421,18 @@ export async function finalizeImportUpload(args: {
       },
     });
 
-    await tx.importBatch.updateMany({
-      where: {
-        cycleId: cycle.id,
-        sourceType: payload.sourceType,
-        isCurrent: true,
-      },
-      data: {
-        isCurrent: false,
-      },
-    });
+    if (payload.sourceType !== "LP") {
+      await tx.importBatch.updateMany({
+        where: {
+          cycleId: cycle.id,
+          sourceType: payload.sourceType,
+          isCurrent: true,
+        },
+        data: {
+          isCurrent: false,
+        },
+      });
+    }
 
     const uploadedFile = await tx.uploadedFile.create({
       data: {
@@ -433,8 +440,7 @@ export async function finalizeImportUpload(args: {
         bucket: payload.bucket,
         storagePath: payload.storagePath,
         originalFilename: payload.fileName,
-        mimeType:
-          fileInfoResult.data.contentType || payload.mimeType || null,
+        mimeType: fileInfoResult.data.contentType || payload.mimeType || null,
         sizeBytes: BigInt(fileInfoResult.data.size ?? payload.fileSizeBytes),
         uploadedByUserId: args.actor.userId,
       },
@@ -449,11 +455,42 @@ export async function finalizeImportUpload(args: {
         uploadedFileId: uploadedFile.id,
         sourceType: payload.sourceType,
         status: "RECEIVED",
-        isCurrent: true,
+        isCurrent: payload.sourceType !== "LP",
         uploadedByUserId: args.actor.userId,
       },
       select: {
         id: true,
+      },
+    });
+
+    await recordAuditLog(tx, {
+      actorType: "USER",
+      actorUserId: args.actor.userId,
+      action: "import_batch.created",
+      entityType: "IMPORT_BATCH",
+      entityId: batch.id,
+      cycleId: cycle.id,
+      batchId: batch.id,
+      metadata: {
+        sourceType: payload.sourceType,
+        uploadedFileId: uploadedFile.id,
+        originalFilename: payload.fileName,
+      },
+    });
+
+    await recordAuditLog(tx, {
+      actorType: "USER",
+      actorUserId: args.actor.userId,
+      action: "import_upload.finalized",
+      entityType: "UPLOADED_FILE",
+      entityId: uploadedFile.id,
+      cycleId: cycle.id,
+      batchId: batch.id,
+      metadata: {
+        sourceType: payload.sourceType,
+        bucket: payload.bucket,
+        storagePath: payload.storagePath,
+        originalFilename: payload.fileName,
       },
     });
 
@@ -518,7 +555,8 @@ export async function finalizeImportUpload(args: {
     ? {
         status: "SKIPPED" as const,
         jobId: null,
-        error: "This upload was already finalized, so no duplicate processing job was enqueued.",
+        error:
+          "This upload was already finalized, so no duplicate processing job was enqueued.",
         jobName: JOBS.PROCESS_IMPORT_BATCH,
       }
     : await enqueueProcessImportBatchJob(enqueuePayload);
@@ -528,8 +566,8 @@ export async function finalizeImportUpload(args: {
     message: result.wasExisting
       ? "This upload was already finalized. Returning the existing VendorStream records."
       : queue.status === "ENQUEUED"
-        ? "Upload completed. VendorStream created the uploaded file record, current import batch, and queued processing for the worker."
-        : "Upload completed and VendorStream saved the batch records, but the processing job could not be queued automatically.",
+        ? "Upload received. VendorStream queued workbook validation for the worker."
+        : "Upload received and VendorStream saved the batch records, but the validation job could not be queued automatically.",
     uploadedFileId: result.uploadedFileId,
     importBatchId: result.importBatchId,
     cycleId: result.cycleId,

@@ -1,4 +1,9 @@
 import Link from "next/link";
+import { getServerSession } from "next-auth";
+import { redirect } from "next/navigation";
+import { prisma, type LpMembershipRole } from "@vendorstream/database";
+import { authOptions } from "@/app/api/auth/[...nextauth]/options";
+import { PageErrorState } from "@/components/page-error-state";
 import {
   Card,
   CardContent,
@@ -7,110 +12,165 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { formatEnumLabel, formatMonthLabel } from "@/lib/format";
+
+type LpProfileUser = {
+  name: string;
+  email: string;
+  isEmailVerified: boolean;
+  systemRole: "USER" | "ADMIN" | "FINANCE_VIEWER" | "UNKNOWN";
+};
 
 type ProfilePageState =
   | {
       kind: "ready";
-      user: {
-        name: string;
-        email: string;
-        isEmailVerified: boolean;
-        systemRole: "USER" | "ADMIN" | "FINANCE_VIEWER";
-      };
+      user: LpProfileUser;
       currentLpContext: {
         name: string;
-        code: string;
-        membershipRole: "LP_ADMIN" | "LP_MANAGER" | "LP_VIEWER";
+        code: string | null;
+        membershipRole: LpMembershipRole;
         storeCoverage: number;
-        cycleMonthLabel: string;
+        latestCycleMonth: Date | null;
       };
       memberships: Array<{
         id: string;
+        lpId: string;
         lpName: string;
-        lpCode: string;
-        membershipRole: "LP_ADMIN" | "LP_MANAGER" | "LP_VIEWER";
-        status: "Active" | "Pending";
+        lpCode: string | null;
+        membershipRole: LpMembershipRole;
+        status: "Active" | "Inactive";
         isCurrent: boolean;
       }>;
     }
   | {
       kind: "empty";
-      user: {
-        name: string;
-        email: string;
-        isEmailVerified: boolean;
-        systemRole: "USER" | "ADMIN" | "FINANCE_VIEWER";
-      };
+      user: LpProfileUser;
     }
   | {
       kind: "error";
       message: string;
-    }
-  | {
-      kind: "loading";
     };
 
 async function getLpProfilePageState(): Promise<ProfilePageState> {
-  const mockMode = process.env.MOCK_LP_PROFILE_STATE;
+  const session = await getServerSession(authOptions);
 
-  if (mockMode === "loading") {
-    return { kind: "loading" };
+  if (!session?.user) {
+    redirect("/login");
   }
 
-  if (mockMode === "error") {
+  if (!session.user.id) {
+    redirect("/login");
+  }
+
+  const user: LpProfileUser = {
+    name: session.user.name?.trim() || "VendorStream User",
+    email: session.user.email?.trim() || "Not available",
+    isEmailVerified: Boolean(session.user.isEmailVerified),
+    systemRole: session.user.systemRole ?? "UNKNOWN",
+  };
+
+  try {
+    const memberships = await prisma.lpMembership.findMany({
+      where: {
+        userId: session.user.id,
+      },
+      orderBy: [
+        {
+          lp: {
+            name: "asc",
+          },
+        },
+      ],
+      select: {
+        id: true,
+        role: true,
+        lp: {
+          select: {
+            id: true,
+            name: true,
+            code: true,
+            isActive: true,
+          },
+        },
+      },
+    });
+
+    if (memberships.length === 0) {
+      return {
+        kind: "empty",
+        user,
+      };
+    }
+
+    const lpIds = memberships.map((membership) => membership.lp.id);
+
+    const [assignmentCounts, latestCycles] = await Promise.all([
+      prisma.storeLocationLpAssignment.groupBy({
+        by: ["lpId"],
+        where: {
+          lpId: {
+            in: lpIds,
+          },
+          isActive: true,
+        },
+        _count: {
+          _all: true,
+        },
+      }),
+      prisma.reconciliationCycle.groupBy({
+        by: ["lpId"],
+        where: {
+          lpId: {
+            in: lpIds,
+          },
+        },
+        _max: {
+          periodMonth: true,
+        },
+      }),
+    ]);
+
+    const assignmentCountByLpId = new Map(
+      assignmentCounts.map((row) => [row.lpId, row._count._all]),
+    );
+    const latestCycleByLpId = new Map(
+      latestCycles.map((row) => [row.lpId, row._max.periodMonth ?? null]),
+    );
+
+    const currentMembershipSource =
+      memberships.find((membership) => membership.lp.isActive) ?? memberships[0];
+
+    return {
+      kind: "ready",
+      user,
+      currentLpContext: {
+        name: currentMembershipSource.lp.name,
+        code: currentMembershipSource.lp.code,
+        membershipRole: currentMembershipSource.role,
+        storeCoverage:
+          assignmentCountByLpId.get(currentMembershipSource.lp.id) ?? 0,
+        latestCycleMonth:
+          latestCycleByLpId.get(currentMembershipSource.lp.id) ?? null,
+      },
+      memberships: memberships.map((membership) => ({
+        id: membership.id,
+        lpId: membership.lp.id,
+        lpName: membership.lp.name,
+        lpCode: membership.lp.code,
+        membershipRole: membership.role,
+        status: membership.lp.isActive ? "Active" : "Inactive",
+        isCurrent: membership.id === currentMembershipSource.id,
+      })),
+    };
+  } catch (error) {
+    console.error("Failed to load LP profile page", error);
+
     return {
       kind: "error",
       message:
         "We could not load LP profile details right now. Try again or contact your VendorStream administrator.",
     };
   }
-
-  if (mockMode === "empty") {
-    return {
-      kind: "empty",
-      user: {
-        name: "Avery Chen",
-        email: "avery.chen@northstarbeverage.com",
-        isEmailVerified: true,
-        systemRole: "USER",
-      },
-    };
-  }
-
-  return {
-    kind: "ready",
-    user: {
-      name: "Avery Chen",
-      email: "avery.chen@northstarbeverage.com",
-      isEmailVerified: true,
-      systemRole: "USER",
-    },
-    currentLpContext: {
-      name: "Northstar Beverage Group",
-      code: "LP-204",
-      membershipRole: "LP_ADMIN",
-      storeCoverage: 14,
-      cycleMonthLabel: "April 2026",
-    },
-    memberships: [
-      {
-        id: "northstar",
-        lpName: "Northstar Beverage Group",
-        lpCode: "LP-204",
-        membershipRole: "LP_ADMIN",
-        status: "Active",
-        isCurrent: true,
-      },
-      {
-        id: "harbor",
-        lpName: "Harbor Ridge Wines",
-        lpCode: "LP-118",
-        membershipRole: "LP_VIEWER",
-        status: "Active",
-        isCurrent: false,
-      },
-    ],
-  };
 }
 
 function StatusPill({
@@ -134,6 +194,10 @@ function StatusPill({
       {label}
     </span>
   );
+}
+
+function formatSystemRole(value: LpProfileUser["systemRole"]) {
+  return formatEnumLabel(value);
 }
 
 function DetailRow({
@@ -179,87 +243,10 @@ function PlaceholderCard({
   );
 }
 
-function LoadingState() {
-  return (
-    <div className="space-y-6">
-      <div className="grid gap-4 lg:grid-cols-[1.3fr_0.7fr]">
-        {[0, 1].map((item) => (
-          <Card
-            key={item}
-            className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl"
-          >
-            <CardHeader className="space-y-3">
-              <div className="h-4 w-28 animate-pulse rounded bg-white/10" />
-              <div className="h-8 w-48 animate-pulse rounded bg-white/10" />
-            </CardHeader>
-            <CardContent className="space-y-3">
-              <div className="h-12 animate-pulse rounded-xl bg-white/8" />
-              <div className="h-12 animate-pulse rounded-xl bg-white/8" />
-              <div className="h-12 animate-pulse rounded-xl bg-white/8" />
-            </CardContent>
-          </Card>
-        ))}
-      </div>
-      <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
-        <CardHeader className="space-y-3">
-          <div className="h-4 w-36 animate-pulse rounded bg-white/10" />
-          <div className="h-6 w-56 animate-pulse rounded bg-white/10" />
-        </CardHeader>
-        <CardContent className="space-y-3">
-          {[0, 1, 2].map((item) => (
-            <div
-              key={item}
-              className="h-16 animate-pulse rounded-xl bg-white/8"
-            />
-          ))}
-        </CardContent>
-      </Card>
-    </div>
-  );
-}
-
-function ErrorState({ message }: { message: string }) {
-  return (
-    <Card className="border border-red-400/20 bg-red-500/8 shadow-2xl backdrop-blur-xl">
-      <CardHeader className="space-y-3">
-        <div className="inline-flex w-fit items-center rounded-full border border-red-400/30 bg-red-500/10 px-3 py-1 text-xs font-medium uppercase tracking-[0.18em] text-red-100">
-          Profile unavailable
-        </div>
-        <CardTitle className="text-2xl text-white">
-          LP profile data could not be loaded
-        </CardTitle>
-        <CardDescription className="text-sm leading-6 text-red-100/90">
-          {message}
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="flex flex-wrap gap-3">
-        <Button
-          asChild
-          className="bg-white text-slate-950 hover:bg-slate-100"
-        >
-          <Link href="/dashboard">Return to dashboard</Link>
-        </Button>
-        <Button
-          asChild
-          variant="outline"
-          className="border-white/15 bg-white/5 text-white hover:bg-white/10"
-        >
-          <Link href="/login">Re-authenticate</Link>
-        </Button>
-      </CardContent>
-    </Card>
-  );
-}
-
 function EmptyState({
   user,
 }: {
-  user: {
-    name: string;
-    email: string;
-    isEmailVerified: boolean;
-    systemRole: "USER" | "ADMIN" | "FINANCE_VIEWER";
-  };
+  user: LpProfileUser;
 }) {
   return (
     <div className="space-y-6">
@@ -288,7 +275,7 @@ function EmptyState({
               />
             }
           />
-          <DetailRow label="System role" value={user.systemRole} />
+          <DetailRow label="System role" value={formatSystemRole(user.systemRole)} />
         </CardContent>
       </Card>
 
@@ -351,7 +338,7 @@ function ReadyState({
             <DetailRow
               label="Email status"
               value={
-                <StatusPill
+              <StatusPill
                   label={
                     state.user.isEmailVerified
                       ? "Verified"
@@ -361,7 +348,10 @@ function ReadyState({
                 />
               }
             />
-            <DetailRow label="System role" value={state.user.systemRole} />
+            <DetailRow
+              label="System role"
+              value={formatSystemRole(state.user.systemRole)}
+            />
           </CardContent>
         </Card>
 
@@ -384,12 +374,12 @@ function ReadyState({
                 {state.currentLpContext.name}
               </div>
               <div className="mt-1 text-sm text-slate-300">
-                {state.currentLpContext.code}
+                {state.currentLpContext.code ?? "Code not assigned"}
               </div>
             </div>
             <DetailRow
               label="Membership role"
-              value={state.currentLpContext.membershipRole}
+              value={formatEnumLabel(state.currentLpContext.membershipRole)}
             />
             <DetailRow
               label="Store coverage"
@@ -397,7 +387,11 @@ function ReadyState({
             />
             <DetailRow
               label="Current cycle"
-              value={state.currentLpContext.cycleMonthLabel}
+              value={
+                state.currentLpContext.latestCycleMonth
+                  ? formatMonthLabel(state.currentLpContext.latestCycleMonth)
+                  : "No cycles generated yet"
+              }
             />
           </CardContent>
         </Card>
@@ -424,7 +418,8 @@ function ReadyState({
                   {membership.lpName}
                 </div>
                 <div className="text-sm text-slate-400">
-                  {membership.lpCode} · {membership.membershipRole}
+                  {membership.lpCode ?? "Code not assigned"} ·{" "}
+                  {formatEnumLabel(membership.membershipRole)}
                 </div>
               </div>
               <div className="flex flex-wrap gap-2">
@@ -487,8 +482,28 @@ export default async function LpProfilePage() {
           </div>
         </header>
 
-        {state.kind === "loading" ? <LoadingState /> : null}
-        {state.kind === "error" ? <ErrorState message={state.message} /> : null}
+        {state.kind === "error" ? (
+          <PageErrorState
+            variant="error"
+            badgeLabel="Profile unavailable"
+            title="LP profile data could not be loaded"
+            description={state.message}
+            actions={
+              <>
+                <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
+                  <Link href="/dashboard">Return to dashboard</Link>
+                </Button>
+                <Button
+                  asChild
+                  variant="outline"
+                  className="border-white/15 bg-white/5 text-white hover:bg-white/10"
+                >
+                  <Link href="/login">Re-authenticate</Link>
+                </Button>
+              </>
+            }
+          />
+        ) : null}
         {state.kind === "empty" ? <EmptyState user={state.user} /> : null}
         {state.kind === "ready" ? <ReadyState state={state} /> : null}
       </div>

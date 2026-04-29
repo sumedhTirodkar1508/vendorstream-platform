@@ -7,6 +7,8 @@ import {
   type StatementTaskStatus,
 } from "@vendorstream/database";
 import { authOptions } from "@/app/api/auth/[...nextauth]/options";
+import { retryStatementTaskAction } from "@/app/(withSidebar)/actions/retry-processing";
+import { canRetryStatementTask } from "@/lib/processing-retry-rules";
 import {
   Card,
   CardContent,
@@ -93,7 +95,10 @@ const STATEMENT_TASK_STATUS_OPTIONS: StatementTaskStatus[] = [
   "CANCELED",
 ];
 
-const FAILED_OR_CANCELED_STATUSES: StatementTaskStatus[] = ["FAILED", "CANCELED"];
+const FAILED_OR_CANCELED_STATUSES: StatementTaskStatus[] = [
+  "FAILED",
+  "CANCELED",
+];
 
 function formatDateTime(date: Date | null) {
   if (!date) {
@@ -257,8 +262,12 @@ async function getAdminStatementTasksState(
       ? (filters.status as StatementTaskStatus)
       : undefined;
 
-    const monthFilter = /^\d{4}-\d{2}$/.test(filters.month) ? filters.month : undefined;
-    const monthDate = monthFilter ? new Date(`${monthFilter}-01T00:00:00.000Z`) : null;
+    const monthFilter = /^\d{4}-\d{2}$/.test(filters.month)
+      ? filters.month
+      : undefined;
+    const monthDate = monthFilter
+      ? new Date(`${monthFilter}-01T00:00:00.000Z`)
+      : null;
 
     const where = {
       ...(statusFilter ? { status: statusFilter } : {}),
@@ -374,19 +383,22 @@ async function getAdminStatementTasksState(
       {
         label: "Pending Tasks",
         value: String(pendingCount),
-        detail: "Tasks still queued and waiting for a worker to start processing.",
+        detail:
+          "Tasks still queued and waiting for a worker to start processing.",
         tone: pendingCount > 0 ? "warning" : "success",
       },
       {
         label: "Completed Tasks",
         value: String(completedCount),
-        detail: "Tasks that completed and produced at least one statement artifact.",
+        detail:
+          "Tasks that completed and produced at least one statement artifact.",
         tone: "success",
       },
       {
         label: "Failed Or Canceled",
         value: String(failedOrCanceledCount),
-        detail: "Tasks requiring intervention or re-run review before closeout.",
+        detail:
+          "Tasks requiring intervention or re-run review before closeout.",
         tone: failedOrCanceledCount > 0 ? "warning" : "neutral",
       },
     ];
@@ -428,7 +440,9 @@ async function getAdminStatementTasksState(
     }));
 
     const selectedTask =
-      mappedRows.find((row) => row.id === filters.taskId) ?? mappedRows[0] ?? null;
+      mappedRows.find((row) => row.id === filters.taskId) ??
+      mappedRows[0] ??
+      null;
 
     return {
       kind: "ready",
@@ -515,8 +529,8 @@ function EmptyState({
         Reviewing statement tasks as{" "}
         <span className="font-medium text-white">{adminName}</span>. Showing{" "}
         <span className="font-medium text-white">{matchingCount}</span> matches
-        across <span className="font-medium text-white">{totalCount}</span> total
-        tasks.
+        across <span className="font-medium text-white">{totalCount}</span>{" "}
+        total tasks.
       </div>
 
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
@@ -630,7 +644,10 @@ function EmptyState({
           </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-wrap gap-3">
-          <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
+          <Button
+            asChild
+            className="bg-white text-slate-950 hover:bg-slate-100"
+          >
             <Link href="/admin/dashboard">Back to admin dashboard</Link>
           </Button>
           <Button
@@ -698,6 +715,7 @@ export default async function AdminStatementTasksPage({
 
   const adminName = session.user.name?.trim() || "VendorStream Admin";
   const state = await getAdminStatementTasksState(filters, adminName);
+  const returnTo = buildStatementTasksHref(filters);
 
   return (
     <main className="relative min-h-screen overflow-hidden text-white">
@@ -726,7 +744,9 @@ export default async function AdminStatementTasksPage({
               Reviewing statement tasks as{" "}
               <span className="font-medium text-white">{state.adminName}</span>.
               Showing{" "}
-              <span className="font-medium text-white">{state.matchingCount}</span>{" "}
+              <span className="font-medium text-white">
+                {state.matchingCount}
+              </span>{" "}
               matches out of{" "}
               <span className="font-medium text-white">{state.totalCount}</span>{" "}
               total tasks.
@@ -844,8 +864,8 @@ export default async function AdminStatementTasksPage({
                   Statement tasks
                 </CardTitle>
                 <CardDescription className="text-sm leading-6 text-slate-300">
-                  Real `StatementTask` records with related cycle, requester, and
-                  generated statement context.
+                  Real `StatementTask` records with related cycle, requester,
+                  and generated statement context.
                 </CardDescription>
               </CardHeader>
               <CardContent>
@@ -856,7 +876,9 @@ export default async function AdminStatementTasksPage({
                         <th className="px-4 py-3 font-medium">Task ID</th>
                         <th className="px-4 py-3 font-medium">Month</th>
                         <th className="px-4 py-3 font-medium">LP</th>
-                        <th className="px-4 py-3 font-medium">Store location</th>
+                        <th className="px-4 py-3 font-medium">
+                          Store location
+                        </th>
                         <th className="px-4 py-3 font-medium">Status</th>
                         <th className="px-4 py-3 font-medium">Attempt count</th>
                         <th className="px-4 py-3 font-medium">Requested by</th>
@@ -871,7 +893,9 @@ export default async function AdminStatementTasksPage({
                         <tr
                           key={row.id}
                           className={`border-b border-white/8 last:border-b-0 ${
-                            row.id === state.selectedTask?.id ? "bg-cyan-400/8" : ""
+                            row.id === state.selectedTask?.id
+                              ? "bg-cyan-400/8"
+                              : ""
                           }`}
                         >
                           <td className="px-4 py-4 text-sm font-medium text-white">
@@ -905,7 +929,9 @@ export default async function AdminStatementTasksPage({
                             {row.attemptCount}
                           </td>
                           <td className="px-4 py-4 text-sm text-slate-300">
-                            {row.requestedByName ?? row.requestedByEmail ?? "Unknown"}
+                            {row.requestedByName ??
+                              row.requestedByEmail ??
+                              "Unknown"}
                           </td>
                           <td className="px-4 py-4 text-sm text-slate-300">
                             {formatDateTime(row.startedAt)}
@@ -954,15 +980,27 @@ export default async function AdminStatementTasksPage({
                                 </Button>
                               )}
 
-                              <Button
-                                type="button"
-                                size="sm"
-                                variant="ghost"
-                                disabled
-                                className="text-slate-300 disabled:text-slate-500"
-                              >
-                                Retry
-                              </Button>
+                              <form action={retryStatementTaskAction}>
+                                <input
+                                  type="hidden"
+                                  name="statementTaskId"
+                                  value={row.id}
+                                />
+                                <input
+                                  type="hidden"
+                                  name="returnTo"
+                                  value={returnTo}
+                                />
+                                <Button
+                                  type="submit"
+                                  size="sm"
+                                  variant="outline"
+                                  disabled={!canRetryStatementTask(row.status)}
+                                  className="border-white/15 bg-white/5 text-white hover:bg-white/10 disabled:text-slate-500"
+                                >
+                                  Retry
+                                </Button>
+                              </form>
 
                               <Button
                                 type="button"
@@ -1015,7 +1053,9 @@ export default async function AdminStatementTasksPage({
                       value={
                         <StatusBadge
                           label={formatEnumLabel(state.selectedTask.status)}
-                          className={getStatementTaskTone(state.selectedTask.status)}
+                          className={getStatementTaskTone(
+                            state.selectedTask.status,
+                          )}
                         />
                       }
                     />
@@ -1076,7 +1116,8 @@ export default async function AdminStatementTasksPage({
                                   {statement.id}
                                 </div>
                                 <div className="text-xs text-slate-500">
-                                  Generated {formatDateTime(statement.generatedAt)}
+                                  Generated{" "}
+                                  {formatDateTime(statement.generatedAt)}
                                 </div>
                               </div>
                               <div className="flex flex-wrap gap-2">
@@ -1090,7 +1131,9 @@ export default async function AdminStatementTasksPage({
                                   variant="outline"
                                   className="border-white/15 bg-white/5 text-white hover:bg-white/10"
                                 >
-                                  <Link href={`/store/statements/${statement.id}`}>
+                                  <Link
+                                    href={`/store/statements/${statement.id}`}
+                                  >
                                     Open statement
                                   </Link>
                                 </Button>
@@ -1120,7 +1163,9 @@ export default async function AdminStatementTasksPage({
                         asChild
                         className="w-full bg-white text-slate-950 hover:bg-slate-100"
                       >
-                        <Link href={`/store/cycles/${state.selectedTask.cycleId}`}>
+                        <Link
+                          href={`/store/cycles/${state.selectedTask.cycleId}`}
+                        >
                           View related cycle
                         </Link>
                       </Button>

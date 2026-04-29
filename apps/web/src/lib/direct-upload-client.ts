@@ -11,33 +11,35 @@ import type {
 
 let cachedSupabaseBrowserClient: SupabaseClient | null = null;
 
-function getRequiredPublicEnv(name: "NEXT_PUBLIC_SUPABASE_URL" | "NEXT_PUBLIC_SUPABASE_ANON_KEY") {
-  const value = process.env[name]?.trim();
-
-  if (!value) {
-    throw new Error(
-      `Missing required client environment variable: ${name}.`,
-    );
-  }
-
-  return value;
-}
+// IMPORTANT:
+// NEXT_PUBLIC_* env vars must be referenced statically in client code.
+// Do not use process.env[name] here.
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL?.trim();
+const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY?.trim();
 
 function getSupabaseBrowserClient() {
   if (cachedSupabaseBrowserClient) {
     return cachedSupabaseBrowserClient;
   }
 
-  cachedSupabaseBrowserClient = createClient(
-    getRequiredPublicEnv("NEXT_PUBLIC_SUPABASE_URL"),
-    getRequiredPublicEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY"),
-    {
-      auth: {
-        autoRefreshToken: false,
-        persistSession: false,
-      },
+  if (!SUPABASE_URL) {
+    throw new Error(
+      "Missing required client environment variable: NEXT_PUBLIC_SUPABASE_URL.",
+    );
+  }
+
+  if (!SUPABASE_ANON_KEY) {
+    throw new Error(
+      "Missing required client environment variable: NEXT_PUBLIC_SUPABASE_ANON_KEY.",
+    );
+  }
+
+  cachedSupabaseBrowserClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
     },
-  );
+  });
 
   return cachedSupabaseBrowserClient;
 }
@@ -61,10 +63,9 @@ export async function runDirectImportUpload(args: {
     body: JSON.stringify(args.intent),
   });
 
-  const intentPayload =
-    await parseJsonResponse<
-      CreateImportUploadIntentSuccess | CreateImportUploadIntentError
-    >(intentResponse);
+  const intentPayload = await parseJsonResponse<
+    CreateImportUploadIntentSuccess | CreateImportUploadIntentError
+  >(intentResponse);
 
   if (!intentResponse.ok || !intentPayload || intentPayload.ok === false) {
     throw new Error(
@@ -105,12 +106,15 @@ export async function runDirectImportUpload(args: {
     }),
   });
 
-  const finalizePayload =
-    await parseJsonResponse<
-      FinalizeImportUploadSuccess | FinalizeImportUploadError
-    >(finalizeResponse);
+  const finalizePayload = await parseJsonResponse<
+    FinalizeImportUploadSuccess | FinalizeImportUploadError
+  >(finalizeResponse);
 
-  if (!finalizeResponse.ok || !finalizePayload || finalizePayload.ok === false) {
+  if (
+    !finalizeResponse.ok ||
+    !finalizePayload ||
+    finalizePayload.ok === false
+  ) {
     throw new Error(
       (finalizePayload &&
         "error" in finalizePayload &&

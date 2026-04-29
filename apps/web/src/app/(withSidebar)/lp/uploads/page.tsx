@@ -2,7 +2,10 @@ import Link from "next/link";
 import { getServerSession } from "next-auth";
 import { redirect } from "next/navigation";
 import { prisma, type ImportBatchStatus } from "@vendorstream/database";
+import { FileSpreadsheet } from "lucide-react";
 import { authOptions } from "@/app/api/auth/[...nextauth]/options";
+import { EmptyState as AppEmptyState } from "@/components/empty-state";
+import { StatusBadge } from "@/components/ui/status-badge";
 import { getLpAccessContextForUser } from "@/lib/lp-access-context";
 import {
   Card,
@@ -12,6 +15,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { formatDateTime, formatMonthLabel } from "@/lib/formatting";
 
 type ImportHistoryRow = {
   id: string;
@@ -88,27 +92,6 @@ function getStatusTone(status: ImportBatchStatus) {
   }
 
   return "border-white/10 bg-white/5 text-slate-200";
-}
-
-function formatMonthLabel(value: Date) {
-  return new Intl.DateTimeFormat("en-US", {
-    month: "long",
-    year: "numeric",
-  }).format(value);
-}
-
-function formatDateTime(value: Date | null) {
-  if (!value) {
-    return "Not available";
-  }
-
-  return new Intl.DateTimeFormat("en-US", {
-    month: "short",
-    day: "numeric",
-    year: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-  }).format(value);
 }
 
 function parseMonthFilter(value: string) {
@@ -268,16 +251,6 @@ async function getLpImportHistoryState(searchParams?: {
   }
 }
 
-function StatusBadge({ status }: { status: ImportBatchStatus }) {
-  return (
-    <span
-      className={`inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-medium ${getStatusTone(status)}`}
-    >
-      {status.replaceAll("_", " ")}
-    </span>
-  );
-}
-
 function FilterForm({
   filters,
 }: {
@@ -413,37 +386,36 @@ function EmptyState({
         </div>
       ) : null}
 
-      <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
-        <CardHeader className="space-y-2">
-          <CardTitle className="text-2xl text-white">
-            No import batches found
-          </CardTitle>
-          <CardDescription className="text-sm leading-6 text-slate-300">
-            {isAccessEmpty
-              ? "This account is not assigned to any LP workspace yet."
-              : hasFilters
-                ? "No LP upload batches match the current filters."
-                : `There are no LP import batches yet for ${lpName}.`}
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="flex flex-wrap gap-3">
-          <Button
-            asChild
-            className="bg-white text-slate-950 hover:bg-slate-100"
-          >
-            <Link href="/lp/uploads/new">Upload Monthly File</Link>
-          </Button>
-          {hasFilters ? (
+      <AppEmptyState
+        icon={<FileSpreadsheet className="h-5 w-5" />}
+        title="No import batches found"
+        description={
+          isAccessEmpty
+            ? "This account is not assigned to any LP workspace yet."
+            : hasFilters
+              ? "No LP upload batches match the current filters."
+              : `There are no LP import batches yet for ${lpName}.`
+        }
+        actions={
+          <>
             <Button
               asChild
-              variant="outline"
-              className="border-white/15 bg-white/5 text-white hover:bg-white/10"
+              className="bg-white text-slate-950 hover:bg-slate-100"
             >
-              <Link href="/lp/uploads">Clear filters</Link>
+              <Link href="/lp/uploads/new">Upload Monthly File</Link>
             </Button>
-          ) : null}
-        </CardContent>
-      </Card>
+            {hasFilters ? (
+              <Button
+                asChild
+                variant="outline"
+                className="border-white/15 bg-white/5 text-white hover:bg-white/10"
+              >
+                <Link href="/lp/uploads">Clear filters</Link>
+              </Button>
+            ) : null}
+          </>
+        }
+      />
     </div>
   );
 }
@@ -526,7 +498,10 @@ function ReadyState({
                   <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
                     Status
                   </div>
-                  <StatusBadge status={row.status} />
+                  <StatusBadge
+                    label={row.status.replaceAll("_", " ")}
+                    className={getStatusTone(row.status)}
+                  />
                 </div>
 
                 <div className="space-y-1">

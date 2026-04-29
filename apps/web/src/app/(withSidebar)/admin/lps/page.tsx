@@ -7,6 +7,7 @@ import {
   type LpMembershipRole,
 } from "@vendorstream/database";
 import { authOptions } from "@/app/api/auth/[...nextauth]/options";
+import { formatMonthLabel } from "@/lib/format";
 import {
   Card,
   CardContent,
@@ -120,10 +121,7 @@ function formatDateTime(date: Date | null) {
 }
 
 function formatMonth(date: Date) {
-  return new Intl.DateTimeFormat("en-US", {
-    month: "long",
-    year: "numeric",
-  }).format(date);
+  return formatMonthLabel(date);
 }
 
 function buildLpsHref(filters: LpFilters) {

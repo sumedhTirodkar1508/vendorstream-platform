@@ -59,6 +59,7 @@ function SignupPageInner() {
   const searchParams = useSearchParams();
 
   const invitedEmail = searchParams.get("registeredemail");
+  const invitedEmailLower = invitedEmail?.toLowerCase() ?? "";
   const nextPath = normalizeNextPath(searchParams.get("next"));
   const isInvitedClaimFlow = Boolean(invitedEmail);
 
@@ -84,20 +85,12 @@ function SignupPageInner() {
     shortGoal: "",
   });
 
-  const [buttonDisabled, setButtonDisabled] = React.useState(true);
   const [loading, setLoading] = React.useState(false);
   const [message, setMessage] = React.useState<Message | null>(null);
   const [hasRedeemedQrWarning, setHasRedeemedQrWarning] = React.useState(false);
 
-  useEffect(() => {
-    if (invitedEmail) {
-      setUser((u) => ({ ...u, email: invitedEmail.toLowerCase() }));
-    }
-  }, [invitedEmail]);
-
-  useEffect(() => {
-    setButtonDisabled(!(user.name && user.email && user.password));
-  }, [user]);
+  const effectiveEmail = isInvitedClaimFlow ? invitedEmailLower : user.email;
+  const isButtonDisabled = !(user.name && effectiveEmail && user.password);
 
   useEffect(() => {
     const loadViewerStatus = async () => {
@@ -118,7 +111,7 @@ function SignupPageInner() {
   const onSignup = async () => {
     setMessage(null);
 
-    if (!user.name || !user.email || !user.password) {
+    if (!user.name || !effectiveEmail || !user.password) {
       setMessage({ type: "error", text: "All fields are required." });
       return;
     }
@@ -153,7 +146,7 @@ function SignupPageInner() {
     try {
       const normalizedUser = {
         name: user.name.trim(),
-        email: user.email.trim().toLowerCase(),
+        email: effectiveEmail.trim().toLowerCase(),
         password: user.password,
       };
 
@@ -337,7 +330,7 @@ function SignupPageInner() {
                         type="email"
                         autoComplete="email"
                         disabled={isInvitedClaimFlow}
-                        value={user.email}
+                        value={effectiveEmail}
                         onChange={(e) =>
                           setUser({
                             ...user,
@@ -369,7 +362,7 @@ function SignupPageInner() {
                 <CardFooter className="flex flex-col gap-3 px-6 pb-0 sm:px-8">
                   <Button
                     type="submit"
-                    disabled={buttonDisabled || loading}
+                    disabled={isButtonDisabled || loading}
                     className="w-full rounded-full py-6 border border-white bg-white text-black hover:scale-[1.01] active:scale-[0.99] transition"
                   >
                     {isInvitedClaimFlow ? "Activate Account" : "Signup"}
@@ -650,7 +643,7 @@ function SignupPageInner() {
                 <CardFooter className="flex flex-col gap-3 px-6 pb-6 sm:px-8">
                   <Button
                     type="submit"
-                    disabled={buttonDisabled || loading}
+                    disabled={isButtonDisabled || loading}
                     className="w-full rounded-full py-6 border border-white bg-white text-black hover:scale-[1.01] active:scale-[0.99] transition"
                   >
                     Submit Application

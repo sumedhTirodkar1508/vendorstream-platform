@@ -1,5 +1,13 @@
 import bcrypt from "bcryptjs";
-import prisma from "../src/index.js";
+import dotenv from "dotenv";
+import path from "node:path";
+
+dotenv.config({
+  path: path.resolve(process.cwd(), "../../.env"),
+  quiet: true,
+});
+
+const { default: prisma } = await import("../src/index.js");
 
 async function main() {
   const adminPasswordHash = await bcrypt.hash("pass", 10);
@@ -35,9 +43,11 @@ async function main() {
 
   const storeUser = await prisma.user.upsert({
     where: { email: "storeadmin@gmail.com" },
-    update: {},
+    update: {
+      name: "Pops Cannabis Store Admin",
+    },
     create: {
-      name: "Maple Retail Store Admin",
+      name: "Pops Cannabis Store Admin",
       email: "storeadmin@gmail.com",
       emailVerified: new Date(),
       passwordHash: storePasswordHash,
@@ -49,7 +59,11 @@ async function main() {
   // LP
   const lp = await prisma.lP.upsert({
     where: { code: "NORTHLEAF" },
-    update: {},
+    update: {
+      name: "NorthLeaf",
+      legalName: "NorthLeaf Licensed Producer Inc.",
+      isActive: true,
+    },
     create: {
       code: "NORTHLEAF",
       name: "NorthLeaf",
@@ -60,12 +74,16 @@ async function main() {
 
   // Store Organization
   const storeOrg = await prisma.storeOrganization.upsert({
-    where: { code: "MAPLE-RETAIL" },
-    update: {},
+    where: { code: "POPS-CANNABIS" },
+    update: {
+      name: "Pops Cannabis Co",
+      legalName: "Pops Cannabis Co",
+      isActive: true,
+    },
     create: {
-      code: "MAPLE-RETAIL",
-      name: "Maple Retail Group",
-      legalName: "Maple Retail Group Ltd.",
+      code: "POPS-CANNABIS",
+      name: "Pops Cannabis Co",
+      legalName: "Pops Cannabis Co",
       isActive: true,
     },
   });
@@ -75,18 +93,26 @@ async function main() {
     where: {
       storeOrganizationId_code: {
         storeOrganizationId: storeOrg.id,
-        code: "TOR-001",
+        code: "POC-001",
       },
     },
-    update: {},
+    update: {
+      name: "Pops Cannabis Co",
+      addressLine1: "150 GOVERNMENT RD W UNIT 260",
+      city: "Kirkland Lake",
+      province: "ON",
+      postalCode: "P2N2E9",
+      country: "CA",
+      isActive: true,
+    },
     create: {
       storeOrganizationId: storeOrg.id,
-      code: "TOR-001",
-      name: "Toronto Downtown Store",
-      addressLine1: "100 King St W",
-      city: "Toronto",
+      code: "POC-001",
+      name: "Pops Cannabis Co",
+      addressLine1: "150 GOVERNMENT RD W UNIT 260",
+      city: "Kirkland Lake",
       province: "ON",
-      postalCode: "M5X1A9",
+      postalCode: "P2N2E9",
       country: "CA",
       isActive: true,
     },
@@ -202,8 +228,8 @@ async function main() {
     data: {
       fileKind: "STORE_UPLOAD",
       bucket: "raw-imports",
-      storagePath: `dev/store/${cycle.id}/maple-store-upload.xlsx`,
-      originalFilename: "maple-store-upload.xlsx",
+      storagePath: `dev/store/${cycle.id}/pops-store-upload.xlsx`,
+      originalFilename: "pops-store-upload.xlsx",
       mimeType:
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
       sizeBytes: BigInt(19456),

@@ -1,4 +1,15 @@
 import Link from "next/link";
+import { getServerSession } from "next-auth";
+import { redirect } from "next/navigation";
+import {
+  prisma,
+  type Prisma,
+  type StatementStatus,
+} from "@vendorstream/database";
+import { authOptions } from "@/app/api/auth/[...nextauth]/options";
+import { StatusBadge } from "@/components/ui/status-badge";
+import { PageErrorState } from "@/components/page-error-state";
+import { Button } from "@/components/ui/button";
 import {
   Card,
   CardContent,
@@ -6,256 +17,227 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
+import {
+  formatCurrency,
+  formatDateTime,
+  formatEnumLabel,
+  formatMonthLabel,
+  formatNumber,
+  formatPercent,
+  formatFileSize,
+} from "@/lib/format";
+import { getLpAccessContextForUser } from "@/lib/lp-access-context";
+import { getStatementStatusBadgeClassName } from "@/lib/status-badges";
 
-type StatementStatus = "DRAFT" | "FINAL" | "FAILED";
-
-type StatementLineItem = {
+type StatementLineItemRow = {
   id: string;
-  barcode: string;
-  productName: string;
-  category: string;
-  reconciledUnits: number;
-  unitPrice: number;
-  commissionPercent: number;
-  commissionAmount: number;
+  barcode: string | null;
+  productName: string | null;
+  category: string | null;
+  reconciledUnits: Prisma.Decimal | null;
+  unitPrice: Prisma.Decimal | null;
+  commissionPercent: Prisma.Decimal | null;
+  commissionAmount: Prisma.Decimal | null;
+  notes: string | null;
 };
 
-type StatementDetail = {
-  id: string;
-  cycleId: string;
-  lpName: string;
-  storeOrganization: string;
-  storeLocation: string;
-  month: string;
-  version: number;
-  status: StatementStatus;
-  generatedAt: string;
-  fileName: string | null;
-  totals: {
-    totalSalesAmount: number;
-    totalCommissionAmount: number;
-    totalUnits: number;
-    lineItemCount: number;
-  };
-  lineItems: StatementLineItem[];
-};
-
-type StatementDetailsState =
+type LpStatementDetailsState =
   | {
       kind: "ready";
-      statement: StatementDetail;
+      statement: {
+        id: string;
+        cycleId: string;
+        lpId: string;
+        lpName: string;
+        storeOrganizationName: string;
+        storeLocationId: string;
+        storeLocationName: string;
+        month: Date;
+        version: number;
+        status: StatementStatus;
+        currency: string;
+        totalSalesAmount: Prisma.Decimal | null;
+        totalSalesUnits: Prisma.Decimal | null;
+        totalCommissionAmount: Prisma.Decimal | null;
+        generatedAt: Date | null;
+        createdAt: Date;
+        updatedAt: Date;
+        generatedFile: {
+          id: string;
+          originalFilename: string;
+          bucket: string;
+          storagePath: string;
+          mimeType: string | null;
+          sizeBytes: bigint;
+          uploadedAt: Date;
+        } | null;
+        lineItems: StatementLineItemRow[];
+      };
     }
   | {
       kind: "missing";
       statementId: string;
     }
   | {
-      kind: "error";
-      message: string;
+      kind: "forbidden";
     }
   | {
-      kind: "loading";
+      kind: "error";
+      message: string;
     };
 
-const mockStatements: StatementDetail[] = [
-  {
-    id: "stmt_apr_downtown_v2",
-    cycleId: "cycle_apr_downtown",
-    lpName: "Northstar Beverage Group",
-    storeOrganization: "Maple Retail Group",
-    storeLocation: "Toronto Downtown",
-    month: "2026-04",
-    version: 2,
-    status: "FINAL",
-    generatedAt: "Apr 10, 2026 09:18 AM",
-    fileName: "statement_apr_2026_toronto_downtown_v2.pdf",
-    totals: {
-      totalSalesAmount: 21452.19,
-      totalCommissionAmount: 2788.64,
-      totalUnits: 9358,
-      lineItemCount: 5,
-    },
-    lineItems: [
-      {
-        id: "line_001",
-        barcode: "0062811045123",
-        productName: "Northstar Lager 473ml",
-        category: "Beer",
-        reconciledUnits: 2210,
-        unitPrice: 2.49,
-        commissionPercent: 13.2,
-        commissionAmount: 726.99,
-      },
-      {
-        id: "line_002",
-        barcode: "0062811045981",
-        productName: "Northstar IPA 355ml",
-        category: "Beer",
-        reconciledUnits: 1890,
-        unitPrice: 2.71,
-        commissionPercent: 12.9,
-        commissionAmount: 661.25,
-      },
-      {
-        id: "line_003",
-        barcode: "0062811047609",
-        productName: "Northstar Session Ale",
-        category: "Beer",
-        reconciledUnits: 1548,
-        unitPrice: 2.17,
-        commissionPercent: 12.5,
-        commissionAmount: 419.90,
-      },
-      {
-        id: "line_004",
-        barcode: "0062811047129",
-        productName: "Northstar Amber Ale",
-        category: "Beer",
-        reconciledUnits: 1736,
-        unitPrice: 2.39,
-        commissionPercent: 13.4,
-        commissionAmount: 555.60,
-      },
-      {
-        id: "line_005",
-        barcode: "0062811034102",
-        productName: "Northstar Pilsner 6-pack",
-        category: "Multipack",
-        reconciledUnits: 1974,
-        unitPrice: 3.62,
-        commissionPercent: 13.7,
-        commissionAmount: 424.90,
-      },
-    ],
-  },
-  {
-    id: "stmt_mar_mississauga_v3",
-    cycleId: "cycle_mar_mississauga",
-    lpName: "Northstar Beverage Group",
-    storeOrganization: "Summit Stores",
-    storeLocation: "Mississauga Central",
-    month: "2026-03",
-    version: 3,
-    status: "FINAL",
-    generatedAt: "Apr 3, 2026 02:16 PM",
-    fileName: "statement_mar_2026_mississauga_central_v3.pdf",
-    totals: {
-      totalSalesAmount: 19874.54,
-      totalCommissionAmount: 2571.83,
-      totalUnits: 8611,
-      lineItemCount: 4,
-    },
-    lineItems: [
-      {
-        id: "line_101",
-        barcode: "0062811045123",
-        productName: "Northstar Lager 473ml",
-        category: "Beer",
-        reconciledUnits: 2144,
-        unitPrice: 2.44,
-        commissionPercent: 13.0,
-        commissionAmount: 680.14,
-      },
-      {
-        id: "line_102",
-        barcode: "0062811045981",
-        productName: "Northstar IPA 355ml",
-        category: "Beer",
-        reconciledUnits: 1828,
-        unitPrice: 2.68,
-        commissionPercent: 12.8,
-        commissionAmount: 626.90,
-      },
-      {
-        id: "line_103",
-        barcode: "00628110478001",
-        productName: "Northstar Citrus Ale",
-        category: "Beer",
-        reconciledUnits: 2086,
-        unitPrice: 2.22,
-        commissionPercent: 12.7,
-        commissionAmount: 588.11,
-      },
-      {
-        id: "line_104",
-        barcode: "0062811034102",
-        productName: "Northstar Pilsner 6-pack",
-        category: "Multipack",
-        reconciledUnits: 2553,
-        unitPrice: 3.42,
-        commissionPercent: 13.2,
-        commissionAmount: 676.68,
-      },
-    ],
-  },
-];
-
-function formatMonthLabel(value: string) {
-  const [year, month] = value.split("-");
-  const parsedDate = new Date(Number(year), Number(month) - 1, 1);
-
-  return new Intl.DateTimeFormat("en-US", {
-    month: "long",
-    year: "numeric",
-  }).format(parsedDate);
-}
-
-function formatCurrency(value: number) {
-  return new Intl.NumberFormat("en-US", {
-    style: "currency",
-    currency: "USD",
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  }).format(value);
-}
-
-function formatPercent(value: number) {
-  return `${value.toFixed(1)}%`;
-}
-
-function getStatusTone(status: StatementStatus) {
-  if (status === "FINAL") {
-    return "border-emerald-400/30 bg-emerald-500/10 text-emerald-100";
-  }
-
-  if (status === "FAILED") {
-    return "border-red-400/30 bg-red-500/10 text-red-100";
-  }
-
-  return "border-amber-400/30 bg-amber-500/10 text-amber-100";
-}
-
-async function getStatementDetailsState(
+async function getLpStatementDetailsState(
   statementId: string,
-): Promise<StatementDetailsState> {
-  const mockMode = process.env.MOCK_LP_STATEMENT_DETAILS_STATE;
+): Promise<LpStatementDetailsState> {
+  const session = await getServerSession(authOptions);
 
-  if (mockMode === "loading") {
-    return { kind: "loading" };
+  if (!session?.user) {
+    redirect("/login");
   }
 
-  if (mockMode === "error") {
+  if (!session.user.id) {
+    redirect("/login");
+  }
+
+  try {
+    const statement = await prisma.statement.findUnique({
+      where: { id: statementId },
+      select: {
+        id: true,
+        cycleId: true,
+        version: true,
+        status: true,
+        currency: true,
+        totalSalesAmount: true,
+        totalSalesUnits: true,
+        totalCommissionAmount: true,
+        generatedAt: true,
+        createdAt: true,
+        updatedAt: true,
+        generatedFile: {
+          select: {
+            id: true,
+            originalFilename: true,
+            bucket: true,
+            storagePath: true,
+            mimeType: true,
+            sizeBytes: true,
+            uploadedAt: true,
+          },
+        },
+        cycle: {
+          select: {
+            id: true,
+            lpId: true,
+            periodMonth: true,
+            lp: {
+              select: {
+                name: true,
+              },
+            },
+            storeLocation: {
+              select: {
+                id: true,
+                name: true,
+                storeOrganization: {
+                  select: {
+                    name: true,
+                  },
+                },
+              },
+            },
+          },
+        },
+        lineItems: {
+          orderBy: [{ sortOrder: "asc" }],
+          select: {
+            id: true,
+            barcode: true,
+            productName: true,
+            categoryKey: true,
+            reconciledUnits: true,
+            unitPrice: true,
+            commissionPercent: true,
+            commissionAmount: true,
+            notes: true,
+            reconciliationResult: {
+              select: {
+                barcode: true,
+                productName: true,
+                categoryKey: true,
+              },
+            },
+          },
+        },
+      },
+    });
+
+    if (!statement) {
+      return {
+        kind: "missing",
+        statementId,
+      };
+    }
+
+    const context = await getLpAccessContextForUser({
+      userId: session.user.id,
+      systemRole: session.user.systemRole,
+    });
+
+    const isAdmin = session.user.systemRole === "ADMIN";
+
+    if (!isAdmin && !context.lpIds.includes(statement.cycle.lpId)) {
+      return {
+        kind: "forbidden",
+      };
+    }
+
+    return {
+      kind: "ready",
+      statement: {
+        id: statement.id,
+        cycleId: statement.cycleId,
+        lpId: statement.cycle.lpId,
+        lpName: statement.cycle.lp.name,
+        storeOrganizationName:
+          statement.cycle.storeLocation.storeOrganization.name,
+        storeLocationId: statement.cycle.storeLocation.id,
+        storeLocationName: statement.cycle.storeLocation.name,
+        month: statement.cycle.periodMonth,
+        version: statement.version,
+        status: statement.status,
+        currency: statement.currency,
+        totalSalesAmount: statement.totalSalesAmount,
+        totalSalesUnits: statement.totalSalesUnits,
+        totalCommissionAmount: statement.totalCommissionAmount,
+        generatedAt: statement.generatedAt,
+        createdAt: statement.createdAt,
+        updatedAt: statement.updatedAt,
+        generatedFile: statement.generatedFile,
+        lineItems: statement.lineItems.map((item) => ({
+          id: item.id,
+          barcode: item.barcode ?? item.reconciliationResult?.barcode ?? null,
+          productName:
+            item.productName ?? item.reconciliationResult?.productName ?? null,
+          category:
+            item.categoryKey ?? item.reconciliationResult?.categoryKey ?? null,
+          reconciledUnits: item.reconciledUnits,
+          unitPrice: item.unitPrice,
+          commissionPercent: item.commissionPercent,
+          commissionAmount: item.commissionAmount,
+          notes: item.notes,
+        })),
+      },
+    };
+  } catch (error) {
+    console.error("Failed to load LP statement details", error);
+
     return {
       kind: "error",
       message:
-        "We could not load this statement right now. Try again shortly or contact VendorStream support if the issue persists.",
+        "We could not load statement details right now. Try again shortly or contact VendorStream support if the issue persists.",
     };
   }
-
-  const statement = mockStatements.find((entry) => entry.id === statementId);
-
-  if (!statement) {
-    return {
-      kind: "missing",
-      statementId,
-    };
-  }
-
-  return {
-    kind: "ready",
-    statement,
-  };
 }
 
 function SummaryCard({
@@ -311,146 +293,59 @@ function DetailRow({
   );
 }
 
-function LoadingState() {
+function ReadyState({
+  statement,
+}: {
+  statement: Extract<LpStatementDetailsState, { kind: "ready" }>["statement"];
+}) {
   return (
     <div className="space-y-6">
-      <div className="grid gap-4 lg:grid-cols-[1.2fr_0.8fr]">
-        {[0, 1].map((item) => (
-          <Card
-            key={item}
-            className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl"
-          >
-            <CardHeader className="space-y-3">
-              <div className="h-4 w-28 animate-pulse rounded bg-white/10" />
-              <div className="h-10 w-64 animate-pulse rounded bg-white/10" />
-            </CardHeader>
-            <CardContent className="space-y-3">
-              <div className="h-12 animate-pulse rounded-xl bg-white/8" />
-              <div className="h-12 animate-pulse rounded-xl bg-white/8" />
-              <div className="h-12 animate-pulse rounded-xl bg-white/8" />
-            </CardContent>
-          </Card>
-        ))}
-      </div>
-
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-        {[0, 1, 2, 3].map((item) => (
-          <div
-            key={item}
-            className="h-36 animate-pulse rounded-2xl border border-white/10 bg-white/6"
-          />
-        ))}
-      </div>
-
-      <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
-        <CardHeader className="space-y-3">
-          <div className="h-5 w-52 animate-pulse rounded bg-white/10" />
-          <div className="h-4 w-72 animate-pulse rounded bg-white/10" />
-        </CardHeader>
-        <CardContent className="space-y-3">
-          {[0, 1, 2, 3].map((item) => (
-            <div
-              key={item}
-              className="h-20 animate-pulse rounded-2xl bg-white/8"
-            />
-          ))}
-        </CardContent>
-      </Card>
-    </div>
-  );
-}
-
-function ErrorState({ message }: { message: string }) {
-  return (
-    <Card className="border border-red-400/20 bg-red-500/8 shadow-2xl backdrop-blur-xl">
-      <CardHeader className="space-y-3">
-        <div className="inline-flex w-fit items-center rounded-full border border-red-400/30 bg-red-500/10 px-3 py-1 text-xs font-medium uppercase tracking-[0.18em] text-red-100">
-          Statement unavailable
-        </div>
-        <CardTitle className="text-2xl text-white">
-          Statement details could not be loaded
-        </CardTitle>
-        <CardDescription className="text-sm leading-6 text-red-100/90">
-          {message}
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="flex flex-wrap gap-3">
-        <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
-          <Link href="/lp/statements">Return to statements</Link>
-        </Button>
-        <Button
-          asChild
-          variant="outline"
-          className="border-white/15 bg-white/5 text-white hover:bg-white/10"
-        >
-          <Link href="/dashboard">Open dashboard</Link>
-        </Button>
-      </CardContent>
-    </Card>
-  );
-}
-
-function MissingState({ statementId }: { statementId: string }) {
-  return (
-    <Card className="border border-amber-400/20 bg-amber-500/8 shadow-2xl backdrop-blur-xl">
-      <CardHeader className="space-y-3">
-        <div className="inline-flex w-fit items-center rounded-full border border-amber-400/30 bg-amber-500/10 px-3 py-1 text-xs font-medium uppercase tracking-[0.18em] text-amber-100">
-          Statement not found
-        </div>
-        <CardTitle className="text-2xl text-white">
-          No generated statement matched this identifier
-        </CardTitle>
-        <CardDescription className="text-sm leading-6 text-amber-100/90">
-          The statement ID{" "}
-          <span className="font-medium text-white">{statementId}</span> is not
-          available in the current LP context.
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="flex flex-wrap gap-3">
-        <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
-          <Link href="/lp/statements">Return to statements</Link>
-        </Button>
-      </CardContent>
-    </Card>
-  );
-}
-
-function ReadyState({ statement }: { statement: StatementDetail }) {
-  return (
-    <div className="space-y-6">
-      <div className="grid gap-4 lg:grid-cols-[1.2fr_0.8fr]">
+      <div className="grid gap-4 xl:grid-cols-[1.2fr_0.8fr]">
         <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
           <CardHeader className="space-y-3">
-            <div className="inline-flex w-fit items-center rounded-full border border-cyan-400/20 bg-cyan-400/10 px-3 py-1 text-xs font-medium uppercase tracking-[0.18em] text-cyan-100">
-              VendorStream
+            <div className="flex flex-wrap items-center gap-3">
+              <div className="inline-flex items-center rounded-full border border-cyan-400/20 bg-cyan-400/10 px-3 py-1 text-xs font-medium uppercase tracking-[0.18em] text-cyan-100">
+                {formatMonthLabel(statement.month)}
+              </div>
+              <StatusBadge
+                label={formatEnumLabel(statement.status)}
+                className={getStatementStatusBadgeClassName(statement.status)}
+              />
             </div>
             <div className="space-y-2">
               <CardTitle className="text-3xl text-white">
-                {statement.lpName} · {statement.storeLocation}
+                {statement.lpName}
               </CardTitle>
               <CardDescription className="text-sm leading-6 text-slate-300">
-                Detailed statement view for {statement.storeOrganization} in{" "}
-                {formatMonthLabel(statement.month)}.
+                {statement.storeOrganizationName} ·{" "}
+                {statement.storeLocationName}
               </CardDescription>
             </div>
           </CardHeader>
-          <CardContent className="space-y-3">
+          <CardContent className="grid gap-3 lg:grid-cols-2">
+            <DetailRow label="Statement ID" value={statement.id} />
+            <DetailRow label="Cycle ID" value={statement.cycleId} />
+            <DetailRow
+              label="Month"
+              value={formatMonthLabel(statement.month)}
+            />
             <DetailRow label="LP" value={statement.lpName} />
             <DetailRow
               label="Store organization"
-              value={statement.storeOrganization}
+              value={statement.storeOrganizationName}
             />
-            <DetailRow label="Store location" value={statement.storeLocation} />
-            <DetailRow label="Month" value={formatMonthLabel(statement.month)} />
+            <DetailRow
+              label="Store location"
+              value={statement.storeLocationName}
+            />
             <DetailRow label="Version" value={`v${statement.version}`} />
             <DetailRow
               label="Status"
               value={
-                <span
-                  className={`inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-medium ${getStatusTone(statement.status)}`}
-                >
-                  {statement.status}
-                </span>
+                <StatusBadge
+                  label={formatEnumLabel(statement.status)}
+                  className={getStatementStatusBadgeClassName(statement.status)}
+                />
               }
             />
           </CardContent>
@@ -458,30 +353,40 @@ function ReadyState({ statement }: { statement: StatementDetail }) {
 
         <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
           <CardHeader className="space-y-2">
-            <CardTitle className="text-xl text-white">Controls</CardTitle>
+            <CardTitle className="text-xl text-white">Actions</CardTitle>
             <CardDescription className="text-sm leading-6 text-slate-300">
-              Quick actions for navigating and exporting this statement.
+              Move between the cycle, statement list, and generated file context
+              for this statement version.
             </CardDescription>
           </CardHeader>
-          <CardContent className="space-y-3">
-            <DetailRow label="Generated at" value={statement.generatedAt} />
-            <DetailRow
-              label="Download file"
-              value={statement.fileName ?? "Pending file generation"}
-            />
-            <div className="flex flex-wrap gap-3 pt-2">
-              <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
-                <Link href="/lp/statements">Back to statements</Link>
-              </Button>
-              <Button
-                type="button"
-                variant="outline"
-                disabled={!statement.fileName}
-                className="border-white/15 bg-white/5 text-white hover:bg-white/10 disabled:text-slate-500"
-              >
-                Download file
-              </Button>
-            </div>
+          <CardContent className="flex flex-col gap-3">
+            <Button
+              asChild
+              className="bg-white text-slate-950 hover:bg-slate-100"
+            >
+              <Link href="/lp/statements">Back to statements</Link>
+            </Button>
+            <Button
+              asChild
+              variant="outline"
+              className="border-white/15 bg-white/5 text-white hover:bg-white/10"
+            >
+              <Link href={`/lp/cycles/${statement.cycleId}`}>View cycle</Link>
+            </Button>
+            <Button
+              asChild={Boolean(statement.generatedFile)}
+              variant="outline"
+              disabled={!statement.generatedFile}
+              className="border-white/15 bg-white/5 text-white hover:bg-white/10 disabled:text-slate-500"
+            >
+              {statement.generatedFile ? (
+                <Link href={`/api/statements/${statement.id}/download`}>
+                  Download file
+                </Link>
+              ) : (
+                <span>Download file</span>
+              )}
+            </Button>
           </CardContent>
         </Card>
       </div>
@@ -489,105 +394,224 @@ function ReadyState({ statement }: { statement: StatementDetail }) {
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
         <SummaryCard
           label="Total Sales"
-          value={formatCurrency(statement.totals.totalSalesAmount)}
+          value={formatCurrency(statement.totalSalesAmount, statement.currency)}
           detail="Aggregate reconciled sales amount for this statement version."
           tone="neutral"
         />
         <SummaryCard
           label="Commission Total"
-          value={formatCurrency(statement.totals.totalCommissionAmount)}
-          detail="Aggregate commission amount calculated across all line items."
+          value={formatCurrency(
+            statement.totalCommissionAmount,
+            statement.currency,
+          )}
+          detail="Total commission value calculated across all included line items."
           tone="success"
         />
         <SummaryCard
           label="Reconciled Units"
-          value={String(statement.totals.totalUnits)}
-          detail="Total reconciled units carried into this statement version."
+          value={formatNumber(statement.totalSalesUnits, {
+            maximumFractionDigits: 0,
+          })}
+          detail="Total reconciled units included in the generated statement."
           tone="neutral"
         />
         <SummaryCard
           label="Line Items"
-          value={String(statement.totals.lineItemCount)}
-          detail="Unique reconciled statement rows included in the detail table."
+          value={String(statement.lineItems.length)}
+          detail="Statement line items currently attached to this version."
           tone="warning"
         />
+      </div>
+
+      <div className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
+        <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
+          <CardHeader className="space-y-2">
+            <CardTitle className="text-xl text-white">
+              Statement metadata
+            </CardTitle>
+            <CardDescription className="text-sm leading-6 text-slate-300">
+              Operational metadata for the current statement version and
+              generated artifact.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <DetailRow
+              label="Generated at"
+              value={formatDateTime(statement.generatedAt)}
+            />
+            <DetailRow
+              label="Created at"
+              value={formatDateTime(statement.createdAt)}
+            />
+            <DetailRow
+              label="Last updated"
+              value={formatDateTime(statement.updatedAt)}
+            />
+            <DetailRow label="Currency" value={statement.currency} />
+            <DetailRow
+              label="Generated file"
+              value={
+                statement.generatedFile?.originalFilename ?? "Not available"
+              }
+            />
+            <DetailRow
+              label="File size"
+              value={formatFileSize(statement.generatedFile?.sizeBytes ?? null)}
+            />
+            <DetailRow
+              label="Storage path"
+              value={
+                statement.generatedFile
+                  ? `${statement.generatedFile.bucket}/${statement.generatedFile.storagePath}`
+                  : "Not available"
+              }
+            />
+          </CardContent>
+        </Card>
+
+        <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
+          <CardHeader className="space-y-2">
+            <CardTitle className="text-xl text-white">
+              Line item coverage
+            </CardTitle>
+            <CardDescription className="text-sm leading-6 text-slate-300">
+              Quick summary of how statement detail is populated for review.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="grid gap-3 sm:grid-cols-2">
+            <DetailRow
+              label="Items with barcode"
+              value={
+                statement.lineItems.filter((item) => Boolean(item.barcode))
+                  .length
+              }
+            />
+            <DetailRow
+              label="Items with category"
+              value={
+                statement.lineItems.filter((item) => Boolean(item.category))
+                  .length
+              }
+            />
+            <DetailRow
+              label="Items with notes"
+              value={
+                statement.lineItems.filter((item) => Boolean(item.notes)).length
+              }
+            />
+            <DetailRow
+              label="Items with commission"
+              value={
+                statement.lineItems.filter(
+                  (item) => item.commissionAmount !== null,
+                ).length
+              }
+            />
+          </CardContent>
+        </Card>
       </div>
 
       <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
         <CardHeader className="space-y-2">
           <CardTitle className="text-xl text-white">Line items</CardTitle>
           <CardDescription className="text-sm leading-6 text-slate-300">
-            Reconciled line-item detail used to produce this statement version.
+            Reconciled detail rows used to produce this statement version.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
-          {statement.lineItems.map((item) => (
-            <div
-              key={item.id}
-              className="rounded-2xl border border-white/8 bg-slate-950/35 px-4 py-4"
-            >
-              <div className="grid gap-4 xl:grid-cols-[1fr_1.2fr_0.8fr_0.8fr_0.8fr_0.8fr_0.9fr] xl:items-start">
-                <div className="space-y-1">
-                  <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
-                    Barcode
+          {statement.lineItems.length > 0 ? (
+            statement.lineItems.map((item) => (
+              <div
+                key={item.id}
+                className="rounded-2xl border border-white/8 bg-slate-950/35 px-4 py-4"
+              >
+                <div className="grid gap-4 xl:grid-cols-[1fr_1.2fr_0.8fr_0.8fr_0.8fr_0.8fr_0.9fr] xl:items-start">
+                  <div className="space-y-1">
+                    <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
+                      Barcode
+                    </div>
+                    <div className="text-sm font-medium text-white">
+                      {item.barcode ?? "Not available"}
+                    </div>
                   </div>
-                  <div className="text-sm font-medium text-white">
-                    {item.barcode}
+
+                  <div className="space-y-1">
+                    <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
+                      Product name
+                    </div>
+                    <div className="text-sm text-white">
+                      {item.productName ?? "Not available"}
+                    </div>
+                  </div>
+
+                  <div className="space-y-1">
+                    <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
+                      Category
+                    </div>
+                    <div className="text-sm text-slate-300">
+                      {item.category ?? "Not available"}
+                    </div>
+                  </div>
+
+                  <div className="space-y-1">
+                    <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
+                      Reconciled units
+                    </div>
+                    <div className="text-sm text-slate-300">
+                      {formatNumber(item.reconciledUnits, {
+                        maximumFractionDigits: 0,
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="space-y-1">
+                    <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
+                      Unit price
+                    </div>
+                    <div className="text-sm text-slate-300">
+                      {formatCurrency(item.unitPrice, statement.currency)}
+                    </div>
+                  </div>
+
+                  <div className="space-y-1">
+                    <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
+                      Commission percent
+                    </div>
+                    <div className="text-sm text-slate-300">
+                      {formatPercent(item.commissionPercent)}
+                    </div>
+                  </div>
+
+                  <div className="space-y-1">
+                    <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
+                      Commission amount
+                    </div>
+                    <div className="text-sm font-medium text-white">
+                      {formatCurrency(
+                        item.commissionAmount,
+                        statement.currency,
+                      )}
+                    </div>
                   </div>
                 </div>
 
-                <div className="space-y-1">
-                  <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
-                    Product name
+                {item.notes ? (
+                  <div className="mt-4 rounded-xl border border-white/8 bg-slate-950/45 px-4 py-3">
+                    <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
+                      Notes
+                    </div>
+                    <div className="mt-1 text-sm leading-6 text-slate-300">
+                      {item.notes}
+                    </div>
                   </div>
-                  <div className="text-sm text-white">{item.productName}</div>
-                </div>
-
-                <div className="space-y-1">
-                  <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
-                    Category
-                  </div>
-                  <div className="text-sm text-slate-300">{item.category}</div>
-                </div>
-
-                <div className="space-y-1">
-                  <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
-                    Reconciled units
-                  </div>
-                  <div className="text-sm text-slate-300">
-                    {item.reconciledUnits}
-                  </div>
-                </div>
-
-                <div className="space-y-1">
-                  <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
-                    Unit price
-                  </div>
-                  <div className="text-sm text-slate-300">
-                    {formatCurrency(item.unitPrice)}
-                  </div>
-                </div>
-
-                <div className="space-y-1">
-                  <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
-                    Commission percent
-                  </div>
-                  <div className="text-sm text-slate-300">
-                    {formatPercent(item.commissionPercent)}
-                  </div>
-                </div>
-
-                <div className="space-y-1">
-                  <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
-                    Commission amount
-                  </div>
-                  <div className="text-sm font-medium text-white">
-                    {formatCurrency(item.commissionAmount)}
-                  </div>
-                </div>
+                ) : null}
               </div>
+            ))
+          ) : (
+            <div className="rounded-2xl border border-dashed border-white/15 bg-slate-950/30 px-4 py-6 text-sm leading-6 text-slate-400">
+              No statement line items have been generated for this version yet.
             </div>
-          ))}
+          )}
         </CardContent>
       </Card>
     </div>
@@ -600,7 +624,7 @@ export default async function LpStatementDetailsPage({
   params: Promise<{ statementId: string }>;
 }) {
   const { statementId } = await params;
-  const state = await getStatementDetailsState(statementId);
+  const state = await getLpStatementDetailsState(statementId);
 
   return (
     <main className="relative min-h-screen overflow-hidden bg-[#06111f] text-white">
@@ -621,18 +645,71 @@ export default async function LpStatementDetailsPage({
               Generated statement detail and line-item breakdown
             </h1>
             <p className="max-w-3xl text-sm leading-7 text-slate-300 sm:text-base">
-              Review one generated statement version, inspect reconciled line items,
-              and verify the financial totals used for downstream finance workflows.
+              Review one generated statement version, inspect reconciled line
+              items, and verify the financial totals used in VendorStream
+              statement output.
             </p>
           </div>
         </header>
 
-        {state.kind === "loading" ? <LoadingState /> : null}
-        {state.kind === "error" ? <ErrorState message={state.message} /> : null}
         {state.kind === "missing" ? (
-          <MissingState statementId={state.statementId} />
+          <PageErrorState
+            variant="missing"
+            badgeLabel="Statement not found"
+            title="No generated statement matched this identifier"
+            description={
+              <>
+                The statement ID{" "}
+                <span className="font-medium text-white">
+                  {state.statementId}
+                </span>{" "}
+                is not available in the current LP context.
+              </>
+            }
+            actions={
+              <Button
+                asChild
+                className="bg-white text-slate-950 hover:bg-slate-100"
+              >
+                <Link href="/lp/statements">Back to statements</Link>
+              </Button>
+            }
+          />
         ) : null}
-        {state.kind === "ready" ? <ReadyState statement={state.statement} /> : null}
+        {state.kind === "forbidden" ? (
+          <PageErrorState
+            variant="forbidden"
+            title="You do not have access to this statement"
+            description="This statement does not belong to an LP workspace in your current access scope."
+            actions={
+              <Button
+                asChild
+                className="bg-white text-slate-950 hover:bg-slate-100"
+              >
+                <Link href="/lp/statements">Back to statements</Link>
+              </Button>
+            }
+          />
+        ) : null}
+        {state.kind === "error" ? (
+          <PageErrorState
+            variant="error"
+            badgeLabel="Statement unavailable"
+            title="Statement details could not be loaded"
+            description={state.message}
+            actions={
+              <Button
+                asChild
+                className="bg-white text-slate-950 hover:bg-slate-100"
+              >
+                <Link href="/lp/statements">Back to statements</Link>
+              </Button>
+            }
+          />
+        ) : null}
+        {state.kind === "ready" ? (
+          <ReadyState statement={state.statement} />
+        ) : null}
       </div>
     </main>
   );

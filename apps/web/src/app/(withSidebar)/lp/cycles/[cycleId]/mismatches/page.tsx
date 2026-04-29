@@ -1,4 +1,12 @@
 import Link from "next/link";
+import { getServerSession } from "next-auth";
+import { redirect } from "next/navigation";
+import { revalidatePath } from "next/cache";
+import { prisma, type Prisma, type $Enums } from "@vendorstream/database";
+import { authOptions } from "@/app/api/auth/[...nextauth]/options";
+import { MismatchResolutionForm } from "@/components/mismatch-resolution-form";
+import { StatusBadge } from "@/components/ui/status-badge";
+import { Button } from "@/components/ui/button";
 import {
   Card,
   CardContent,
@@ -6,258 +14,91 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
+import {
+  formatDateTime,
+  formatEnumLabel,
+  formatMonthLabel,
+} from "@/lib/format";
+import { getLpAccessContextForUser } from "@/lib/lp-access-context";
+import { resolveMismatch } from "@/lib/mismatch-resolution-server";
+import { getMismatchStatusBadgeClassName } from "@/lib/status-badges";
 
-type MismatchType =
-  | "MISSING_COUNTERPART"
-  | "FIELD_DIFFERENCE"
-  | "DUPLICATE_ROW"
-  | "BARCODE_NORMALIZATION"
-  | "PRICE_RULE";
+type MismatchStatus = $Enums.MismatchStatus;
+type MismatchType = $Enums.MismatchType;
+type ResolutionAction = $Enums.ResolutionAction;
 
-type MismatchStatus = "OPEN" | "RESOLVED" | "WAIVED";
-type ResolutionAction =
-  | "Accept LP"
-  | "Accept Store"
-  | "Manual Override"
-  | "Waive"
-  | "Comment";
 type ReviewTab = "open" | "resolved" | "waived";
 
 type MismatchRow = {
   id: string;
-  mismatchType: MismatchType;
+  type: MismatchType;
   status: MismatchStatus;
-  fieldName: string;
+  fieldName: string | null;
   message: string;
   barcode: string | null;
   productName: string | null;
-  lpValue: string | null;
-  storeValue: string | null;
   resolvedBy: string | null;
-  resolvedAt: string | null;
-  comments: string[];
-  resolutionSummary: string | null;
-  availableActions: ResolutionAction[];
+  resolvedAt: Date | null;
+  details: Prisma.JsonValue | null;
+  latestResolution: {
+    id: string;
+    action: ResolutionAction;
+    comment: string | null;
+    createdAt: Date;
+    createdBy: string;
+  } | null;
+  resolutions: Array<{
+    id: string;
+    action: ResolutionAction;
+    comment: string | null;
+    payload: Prisma.JsonValue | null;
+    createdAt: Date;
+    createdBy: string;
+  }>;
 };
 
-type CycleMismatchState =
+type LpCycleMismatchState =
   | {
       kind: "ready";
       cycle: {
         id: string;
         lpName: string;
-        storeOrganization: string;
-        storeLocation: string;
-        month: string;
-        cycleStatus: string;
+        storeOrganizationName: string;
+        storeLocationName: string;
+        month: Date;
+        status: string;
       };
       activeTab: ReviewTab;
-      mismatches: MismatchRow[];
-      selectedMismatch: MismatchRow | null;
       counts: Record<ReviewTab, number>;
+      rows: MismatchRow[];
+      selectedMismatch: MismatchRow | null;
+      canManageResolutions: boolean;
     }
   | {
       kind: "empty";
       cycle: {
         id: string;
         lpName: string;
-        storeOrganization: string;
-        storeLocation: string;
-        month: string;
-        cycleStatus: string;
+        storeOrganizationName: string;
+        storeLocationName: string;
+        month: Date;
+        status: string;
       };
       activeTab: ReviewTab;
       counts: Record<ReviewTab, number>;
+      canManageResolutions: boolean;
     }
   | {
       kind: "missing";
       cycleId: string;
     }
   | {
-      kind: "error";
-      message: string;
+      kind: "forbidden";
     }
   | {
-      kind: "loading";
+      kind: "error";
+      message: string;
     };
-
-const mockCycleMismatchData = {
-  cycle_apr_downtown: {
-    cycle: {
-      id: "cycle_apr_downtown",
-      lpName: "Northstar Beverage Group",
-      storeOrganization: "Maple Retail Group",
-      storeLocation: "Toronto Downtown",
-      month: "2026-04",
-      cycleStatus: "MISMATCHES_FOUND",
-    },
-    mismatches: [
-      {
-        id: "mm_001",
-        mismatchType: "MISSING_COUNTERPART",
-        status: "OPEN",
-        fieldName: "sales_units",
-        message:
-          "LP row exists but no matching store counterpart row was found.",
-        barcode: "0062811045123",
-        productName: "Northstar Lager 473ml",
-        lpValue: "24",
-        storeValue: null,
-        resolvedBy: null,
-        resolvedAt: null,
-        comments: [
-          "Counterpart row may be missing due to store-side barcode alias handling.",
-        ],
-        resolutionSummary: null,
-        availableActions: [
-          "Accept LP",
-          "Accept Store",
-          "Manual Override",
-          "Waive",
-          "Comment",
-        ],
-      },
-      {
-        id: "mm_002",
-        mismatchType: "FIELD_DIFFERENCE",
-        status: "OPEN",
-        fieldName: "net_sales",
-        message: "LP and store values differ outside configured tolerance.",
-        barcode: "0062811045981",
-        productName: "Northstar IPA 355ml",
-        lpValue: "$1,426.17",
-        storeValue: "$1,399.44",
-        resolvedBy: null,
-        resolvedAt: null,
-        comments: ["Review monthly discount treatment before resolution."],
-        resolutionSummary: null,
-        availableActions: [
-          "Accept LP",
-          "Accept Store",
-          "Manual Override",
-          "Waive",
-          "Comment",
-        ],
-      },
-      {
-        id: "mm_003",
-        mismatchType: "BARCODE_NORMALIZATION",
-        status: "OPEN",
-        fieldName: "barcode",
-        message: "Barcode normalization produced multiple possible matches.",
-        barcode: "628110478001",
-        productName: "Northstar Citrus Ale",
-        lpValue: "628110478001",
-        storeValue: "00628110478001",
-        resolvedBy: null,
-        resolvedAt: null,
-        comments: [
-          "Store workbook used a padded UPC variant; verify canonical barcode.",
-        ],
-        resolutionSummary: null,
-        availableActions: [
-          "Accept LP",
-          "Accept Store",
-          "Manual Override",
-          "Waive",
-          "Comment",
-        ],
-      },
-      {
-        id: "mm_004",
-        mismatchType: "DUPLICATE_ROW",
-        status: "RESOLVED",
-        fieldName: "row_identity",
-        message: "Duplicate LP row was detected during normalization.",
-        barcode: "0062811034102",
-        productName: "Northstar Pilsner 6-pack",
-        lpValue: "2 duplicate rows",
-        storeValue: "1 matched row",
-        resolvedBy: "Avery Chen",
-        resolvedAt: "Apr 9, 2026 03:12 PM",
-        comments: ["Resolved by keeping the latest LP export row."],
-        resolutionSummary:
-          "Accepted LP latest row and closed duplicate exception.",
-        availableActions: [
-          "Accept LP",
-          "Accept Store",
-          "Manual Override",
-          "Waive",
-          "Comment",
-        ],
-      },
-      {
-        id: "mm_005",
-        mismatchType: "PRICE_RULE",
-        status: "WAIVED",
-        fieldName: "per_unit_price",
-        message: "Fallback pricing formula produced a non-blocking variance.",
-        barcode: "0062811047609",
-        productName: "Northstar Session Ale",
-        lpValue: "$2.19",
-        storeValue: "$2.17",
-        resolvedBy: "Jordan Patel",
-        resolvedAt: "Apr 9, 2026 09:48 AM",
-        comments: ["Waived per monthly pricing exception policy."],
-        resolutionSummary: "Waived after policy review; no statement impact.",
-        availableActions: [
-          "Accept LP",
-          "Accept Store",
-          "Manual Override",
-          "Waive",
-          "Comment",
-        ],
-      },
-      {
-        id: "mm_006",
-        mismatchType: "FIELD_DIFFERENCE",
-        status: "RESOLVED",
-        fieldName: "sales_units",
-        message:
-          "Unit count mismatch was resolved after store-side correction.",
-        barcode: "0062811047129",
-        productName: "Northstar Amber Ale",
-        lpValue: "18",
-        storeValue: "16",
-        resolvedBy: "Dana Brooks",
-        resolvedAt: "Apr 9, 2026 11:05 AM",
-        comments: [
-          "Store accepted LP count after audit against source invoices.",
-        ],
-        resolutionSummary: "Accepted LP units and synced store-side value.",
-        availableActions: [
-          "Accept LP",
-          "Accept Store",
-          "Manual Override",
-          "Waive",
-          "Comment",
-        ],
-      },
-    ] satisfies MismatchRow[],
-  },
-  cycle_mar_mississauga: {
-    cycle: {
-      id: "cycle_mar_mississauga",
-      lpName: "Northstar Beverage Group",
-      storeOrganization: "Summit Stores",
-      storeLocation: "Mississauga Central",
-      month: "2026-03",
-      cycleStatus: "STATEMENT_READY",
-    },
-    mismatches: [] satisfies MismatchRow[],
-  },
-} as const;
-
-function formatMonthLabel(value: string) {
-  const [year, month] = value.split("-");
-  const parsedDate = new Date(Number(year), Number(month) - 1, 1);
-
-  return new Intl.DateTimeFormat("en-US", {
-    month: "long",
-    year: "numeric",
-  }).format(parsedDate);
-}
 
 function normalizeTab(value: string | undefined): ReviewTab {
   if (value === "resolved" || value === "waived") {
@@ -267,11 +108,7 @@ function normalizeTab(value: string | undefined): ReviewTab {
   return "open";
 }
 
-function buildTabHref(
-  cycleId: string,
-  tab: ReviewTab,
-  mismatchId?: string | null,
-) {
+function buildTabHref(cycleId: string, tab: ReviewTab, mismatchId?: string | null) {
   const params = new URLSearchParams();
   params.set("view", tab);
 
@@ -282,120 +119,434 @@ function buildTabHref(
   return `/lp/cycles/${cycleId}/mismatches?${params.toString()}`;
 }
 
-function formatMismatchType(value: MismatchType) {
-  return value.replaceAll("_", " ");
+function getMutationBanner(mutation: string | undefined) {
+  if (mutation === "resolved_accept_lp") {
+    return {
+      tone: "success" as const,
+      message: "Mismatch resolved with Accept LP.",
+    };
+  }
+
+  if (mutation === "resolved_accept_store") {
+    return {
+      tone: "success" as const,
+      message: "Mismatch resolved with Accept store.",
+    };
+  }
+
+  if (mutation === "resolved_manual_override") {
+    return {
+      tone: "success" as const,
+      message: "Manual override recorded and mismatch marked resolved.",
+    };
+  }
+
+  if (mutation === "waived") {
+    return {
+      tone: "success" as const,
+      message: "Mismatch waived successfully.",
+    };
+  }
+
+  if (mutation === "commented") {
+    return {
+      tone: "success" as const,
+      message: "Comment recorded successfully.",
+    };
+  }
+
+  if (mutation === "invalid") {
+    return {
+      tone: "warning" as const,
+      message:
+        "The submitted mismatch resolution was invalid. Check the action, comment, and payload fields.",
+    };
+  }
+
+  if (mutation === "invalid_payload") {
+    return {
+      tone: "warning" as const,
+      message: "Manual override payload must be valid JSON.",
+    };
+  }
+
+  if (mutation === "forbidden") {
+    return {
+      tone: "warning" as const,
+      message: "You are not authorized to resolve mismatches in this LP workspace.",
+    };
+  }
+
+  if (mutation === "not_found") {
+    return {
+      tone: "warning" as const,
+      message: "The selected mismatch could not be found.",
+    };
+  }
+
+  if (mutation === "already_closed") {
+    return {
+      tone: "warning" as const,
+      message:
+        "This mismatch is already closed. Only comment-only entries can be added now.",
+    };
+  }
+
+  if (mutation === "error") {
+    return {
+      tone: "warning" as const,
+      message: "Mismatch resolution could not be completed. Try again shortly.",
+    };
+  }
+
+  return null;
 }
 
-function getStatusTone(status: MismatchStatus) {
-  if (status === "RESOLVED") {
-    return "border-emerald-400/30 bg-emerald-500/10 text-emerald-100";
+async function submitLpMismatchResolution(formData: FormData) {
+  "use server";
+
+  const session = await getServerSession(authOptions);
+
+  if (!session?.user) {
+    redirect("/login");
   }
 
-  if (status === "WAIVED") {
-    return "border-amber-400/30 bg-amber-500/10 text-amber-100";
+  const cycleId = String(formData.get("cycleId") || "").trim();
+  const currentView = normalizeTab(String(formData.get("currentView") || "").trim());
+  const mismatchId = String(formData.get("mismatchId") || "").trim();
+  const resolutionAction = String(formData.get("resolutionAction") || "").trim();
+  const comment = String(formData.get("comment") || "");
+  const payloadJson = String(formData.get("payloadJson") || "");
+
+  const fallbackHref = buildTabHref(cycleId, currentView, mismatchId || undefined);
+
+  if (!session.user.id || !cycleId || !mismatchId) {
+    redirect(`${fallbackHref}&mutation=invalid`);
   }
 
-  return "border-white/10 bg-white/5 text-slate-200";
+  const result = await resolveMismatch({
+    mismatchId,
+    action: resolutionAction as $Enums.ResolutionAction,
+    actor: {
+      userId: session.user.id,
+      systemRole: session.user.systemRole,
+    },
+    workspace: "LP",
+    comment,
+    payloadJson,
+  });
+
+  if (result.status !== "success") {
+    const href = buildTabHref(
+      result.cycleId ?? cycleId,
+      currentView,
+      result.mismatchId ?? mismatchId,
+    );
+
+    redirect(`${href}&mutation=${result.status}`);
+  }
+
+  revalidatePath("/dashboard");
+  revalidatePath("/lp/cycles");
+  revalidatePath(`/lp/cycles/${result.cycleId}`);
+  revalidatePath(`/lp/cycles/${result.cycleId}/mismatches`);
+
+  redirect(
+    `${buildTabHref(result.cycleId, result.nextTab, result.mismatchId)}&mutation=${
+      result.action === "WAIVE"
+        ? "waived"
+        : result.action === "COMMENT_ONLY"
+          ? "commented"
+          : result.action === "MANUAL_OVERRIDE"
+            ? "resolved_manual_override"
+            : result.action === "ACCEPT_LP"
+              ? "resolved_accept_lp"
+              : "resolved_accept_store"
+    }`,
+  );
 }
 
 function getTypeTone(type: MismatchType) {
-  if (type === "FIELD_DIFFERENCE" || type === "PRICE_RULE") {
+  if (
+    type === "FIELD_DIFFERENCE" ||
+    type === "PRICE_FORMULA_FALLBACK" ||
+    type === "BUSINESS_RULE_VIOLATION"
+  ) {
     return "border-cyan-400/20 bg-cyan-400/10 text-cyan-100";
   }
 
-  if (type === "MISSING_COUNTERPART" || type === "DUPLICATE_ROW") {
+  if (
+    type === "MISSING_COUNTERPART" ||
+    type === "DUPLICATE_ROW" ||
+    type === "MANUAL_REVIEW_REQUIRED"
+  ) {
     return "border-amber-400/20 bg-amber-400/10 text-amber-100";
   }
 
   return "border-white/10 bg-white/5 text-slate-200";
 }
 
-async function getCycleMismatchState(
+function getBarcodeAndProduct(mismatch: {
+  details: Prisma.JsonValue | null;
+  reconciliationResult: {
+    barcode: string | null;
+    productName: string | null;
+  } | null;
+}) {
+  const details =
+    mismatch.details &&
+    typeof mismatch.details === "object" &&
+    !Array.isArray(mismatch.details)
+      ? mismatch.details
+      : null;
+
+  const barcodeFromDetails =
+    details && typeof details.barcode === "string" ? details.barcode : null;
+  const productFromDetails =
+    details && typeof details.productName === "string"
+      ? details.productName
+      : null;
+
+  return {
+    barcode: mismatch.reconciliationResult?.barcode ?? barcodeFromDetails,
+    productName:
+      mismatch.reconciliationResult?.productName ?? productFromDetails,
+  };
+}
+
+async function getLpCycleMismatchState(
   cycleId: string,
   searchParams?: {
     view?: string;
     mismatchId?: string;
+    mutation?: string;
   },
-): Promise<CycleMismatchState> {
-  const mockMode = process.env.MOCK_LP_CYCLE_MISMATCHES_STATE;
-  const activeTab = normalizeTab(searchParams?.view);
+): Promise<LpCycleMismatchState> {
+  const session = await getServerSession(authOptions);
 
-  if (mockMode === "loading") {
-    return { kind: "loading" };
+  if (!session?.user) {
+    redirect("/login");
   }
 
-  if (mockMode === "error") {
+  if (!session.user.id) {
+    redirect("/login");
+  }
+
+  const activeTab = normalizeTab(searchParams?.view);
+
+  try {
+    const cycle = await prisma.reconciliationCycle.findUnique({
+      where: { id: cycleId },
+      select: {
+        id: true,
+        lpId: true,
+        periodMonth: true,
+        status: true,
+        lp: {
+          select: {
+            name: true,
+          },
+        },
+        storeLocation: {
+          select: {
+            name: true,
+            storeOrganization: {
+              select: {
+                name: true,
+              },
+            },
+          },
+        },
+        mismatches: {
+          where: {
+            ...(activeTab === "open"
+              ? { status: "OPEN" }
+              : activeTab === "resolved"
+                ? { status: "RESOLVED" }
+                : { status: "WAIVED" }),
+          },
+          orderBy: [{ createdAt: "desc" }],
+          select: {
+            id: true,
+            type: true,
+            status: true,
+            fieldName: true,
+            message: true,
+            details: true,
+            resolvedAt: true,
+            resolvedBy: {
+              select: {
+                name: true,
+                email: true,
+              },
+            },
+            reconciliationResult: {
+              select: {
+                barcode: true,
+                productName: true,
+              },
+            },
+            resolutions: {
+              orderBy: [{ createdAt: "desc" }],
+              select: {
+                id: true,
+                action: true,
+                comment: true,
+                payload: true,
+                createdAt: true,
+                createdBy: {
+                  select: {
+                    name: true,
+                    email: true,
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    if (!cycle) {
+      return {
+        kind: "missing",
+        cycleId,
+      };
+    }
+
+    const context = await getLpAccessContextForUser({
+      userId: session.user.id,
+      systemRole: session.user.systemRole,
+    });
+
+    const isAdmin = session.user.systemRole === "ADMIN";
+    const membership = await prisma.lpMembership.findFirst({
+      where: {
+        userId: session.user.id,
+        lpId: cycle.lpId,
+      },
+      select: {
+        role: true,
+      },
+    });
+    const canManageResolutions =
+      isAdmin ||
+      membership?.role === "LP_ADMIN" ||
+      membership?.role === "LP_MANAGER";
+
+    if (!isAdmin && !context.lpIds.includes(cycle.lpId)) {
+      return { kind: "forbidden" };
+    }
+
+    const countsQuery = await prisma.mismatch.groupBy({
+      by: ["status"],
+      where: {
+        cycleId,
+      },
+      _count: {
+        _all: true,
+      },
+    });
+
+    const counts: Record<ReviewTab, number> = {
+      open:
+        countsQuery.find((entry) => entry.status === "OPEN")?._count._all ?? 0,
+      resolved:
+        countsQuery.find((entry) => entry.status === "RESOLVED")?._count._all ??
+        0,
+      waived:
+        countsQuery.find((entry) => entry.status === "WAIVED")?._count._all ?? 0,
+    };
+
+    const rows: MismatchRow[] = cycle.mismatches.map((mismatch) => {
+      const latestResolution = mismatch.resolutions[0] ?? null;
+      const identity = getBarcodeAndProduct(mismatch);
+
+      return {
+        id: mismatch.id,
+        type: mismatch.type,
+        status: mismatch.status,
+        fieldName: mismatch.fieldName,
+        message: mismatch.message,
+        barcode: identity.barcode,
+        productName: identity.productName,
+        resolvedBy:
+          mismatch.resolvedBy?.name || mismatch.resolvedBy?.email || null,
+        resolvedAt: mismatch.resolvedAt,
+        details: mismatch.details,
+        latestResolution: latestResolution
+          ? {
+              id: latestResolution.id,
+              action: latestResolution.action,
+              comment: latestResolution.comment,
+              createdAt: latestResolution.createdAt,
+              createdBy:
+                latestResolution.createdBy.name ||
+                latestResolution.createdBy.email ||
+                "Unknown user",
+            }
+          : null,
+        resolutions: mismatch.resolutions.map((resolution) => ({
+          id: resolution.id,
+          action: resolution.action,
+          comment: resolution.comment,
+          payload: resolution.payload,
+          createdAt: resolution.createdAt,
+          createdBy:
+            resolution.createdBy.name ||
+            resolution.createdBy.email ||
+            "Unknown user",
+        })),
+      };
+    });
+
+    if (rows.length === 0) {
+      return {
+        kind: "empty",
+        cycle: {
+          id: cycle.id,
+          lpName: cycle.lp.name,
+          storeOrganizationName: cycle.storeLocation.storeOrganization.name,
+          storeLocationName: cycle.storeLocation.name,
+          month: cycle.periodMonth,
+          status: cycle.status,
+        },
+        activeTab,
+        counts,
+        canManageResolutions,
+      };
+    }
+
+    const selectedMismatch =
+      rows.find((row) => row.id === searchParams?.mismatchId?.trim()) ??
+      rows[0] ??
+      null;
+
+    return {
+      kind: "ready",
+      cycle: {
+        id: cycle.id,
+        lpName: cycle.lp.name,
+        storeOrganizationName: cycle.storeLocation.storeOrganization.name,
+        storeLocationName: cycle.storeLocation.name,
+        month: cycle.periodMonth,
+        status: cycle.status,
+      },
+      activeTab,
+      counts,
+      rows,
+      selectedMismatch,
+      canManageResolutions,
+    };
+  } catch (error) {
+    console.error("Failed to load LP cycle mismatches", error);
+
     return {
       kind: "error",
       message:
         "We could not load mismatch review data right now. Try again shortly or contact VendorStream support if the issue persists.",
     };
   }
-
-  const cycleRecord =
-    mockCycleMismatchData[cycleId as keyof typeof mockCycleMismatchData];
-
-  if (!cycleRecord) {
-    return {
-      kind: "missing",
-      cycleId,
-    };
-  }
-
-  const counts: Record<ReviewTab, number> = {
-    open: cycleRecord.mismatches.filter((entry) => entry.status === "OPEN")
-      .length,
-    resolved: cycleRecord.mismatches.filter(
-      (entry) => entry.status === "RESOLVED",
-    ).length,
-    waived: cycleRecord.mismatches.filter((entry) => entry.status === "WAIVED")
-      .length,
-  };
-
-  const filteredMismatches = cycleRecord.mismatches.filter((entry) => {
-    if (activeTab === "resolved") {
-      return entry.status === "RESOLVED";
-    }
-
-    if (activeTab === "waived") {
-      return entry.status === "WAIVED";
-    }
-
-    return entry.status === "OPEN";
-  });
-
-  if (filteredMismatches.length === 0) {
-    return {
-      kind: "empty",
-      cycle: cycleRecord.cycle,
-      activeTab,
-      counts,
-    };
-  }
-
-  const selectedMismatch =
-    filteredMismatches.find((entry) => entry.id === searchParams?.mismatchId) ??
-    filteredMismatches[0] ??
-    null;
-
-  return {
-    kind: "ready",
-    cycle: cycleRecord.cycle,
-    activeTab,
-    mismatches: filteredMismatches,
-    selectedMismatch,
-    counts,
-  };
-}
-
-function Badge({ label, className }: { label: string; className: string }) {
-  return (
-    <span
-      className={`inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-medium ${className}`}
-    >
-      {label}
-    </span>
-  );
 }
 
 function DetailRow({
@@ -410,83 +561,6 @@ function DetailRow({
       <div className="text-sm text-slate-400">{label}</div>
       <div className="text-sm font-medium text-white">{value}</div>
     </div>
-  );
-}
-
-function LoadingState() {
-  return (
-    <div className="space-y-6">
-      <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
-        <CardHeader className="space-y-3">
-          <div className="h-4 w-28 animate-pulse rounded bg-white/10" />
-          <div className="h-10 w-72 animate-pulse rounded bg-white/10" />
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <div className="h-12 animate-pulse rounded-xl bg-white/8" />
-          <div className="h-12 animate-pulse rounded-xl bg-white/8" />
-        </CardContent>
-      </Card>
-
-      <div className="grid gap-4 xl:grid-cols-[1.35fr_0.65fr]">
-        <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
-          <CardHeader className="space-y-3">
-            <div className="h-8 w-64 animate-pulse rounded bg-white/10" />
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {[0, 1, 2, 3].map((item) => (
-              <div
-                key={item}
-                className="h-24 animate-pulse rounded-2xl bg-white/8"
-              />
-            ))}
-          </CardContent>
-        </Card>
-
-        <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
-          <CardHeader className="space-y-3">
-            <div className="h-8 w-40 animate-pulse rounded bg-white/10" />
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {[0, 1, 2].map((item) => (
-              <div
-                key={item}
-                className="h-14 animate-pulse rounded-xl bg-white/8"
-              />
-            ))}
-          </CardContent>
-        </Card>
-      </div>
-    </div>
-  );
-}
-
-function ErrorState({ message }: { message: string }) {
-  return (
-    <Card className="border border-red-400/20 bg-red-500/8 shadow-2xl backdrop-blur-xl">
-      <CardHeader className="space-y-3">
-        <div className="inline-flex w-fit items-center rounded-full border border-red-400/30 bg-red-500/10 px-3 py-1 text-xs font-medium uppercase tracking-[0.18em] text-red-100">
-          Mismatch review unavailable
-        </div>
-        <CardTitle className="text-2xl text-white">
-          Cycle mismatches could not be loaded
-        </CardTitle>
-        <CardDescription className="text-sm leading-6 text-red-100/90">
-          {message}
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="flex flex-wrap gap-3">
-        <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
-          <Link href="/lp/cycles">Return to cycles</Link>
-        </Button>
-        <Button
-          asChild
-          variant="outline"
-          className="border-white/15 bg-white/5 text-white hover:bg-white/10"
-        >
-          <Link href="/dashboard">Open dashboard</Link>
-        </Button>
-      </CardContent>
-    </Card>
   );
 }
 
@@ -505,9 +579,56 @@ function MissingState({ cycleId }: { cycleId: string }) {
           does not match a cycle in the current LP context.
         </CardDescription>
       </CardHeader>
-      <CardContent className="flex flex-wrap gap-3">
+      <CardContent>
         <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
-          <Link href="/lp/cycles">Return to cycles</Link>
+          <Link href="/lp/cycles">Back to cycles</Link>
+        </Button>
+      </CardContent>
+    </Card>
+  );
+}
+
+function ForbiddenState() {
+  return (
+    <Card className="border border-red-400/20 bg-red-500/8 shadow-2xl backdrop-blur-xl">
+      <CardHeader className="space-y-3">
+        <div className="inline-flex w-fit items-center rounded-full border border-red-400/30 bg-red-500/10 px-3 py-1 text-xs font-medium uppercase tracking-[0.18em] text-red-100">
+          Access restricted
+        </div>
+        <CardTitle className="text-2xl text-white">
+          You do not have access to this mismatch workspace
+        </CardTitle>
+        <CardDescription className="text-sm leading-6 text-red-100/90">
+          This cycle does not belong to an LP workspace in your current access
+          scope.
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
+          <Link href="/lp/cycles">Back to cycles</Link>
+        </Button>
+      </CardContent>
+    </Card>
+  );
+}
+
+function ErrorState({ message }: { message: string }) {
+  return (
+    <Card className="border border-red-400/20 bg-red-500/8 shadow-2xl backdrop-blur-xl">
+      <CardHeader className="space-y-3">
+        <div className="inline-flex w-fit items-center rounded-full border border-red-400/30 bg-red-500/10 px-3 py-1 text-xs font-medium uppercase tracking-[0.18em] text-red-100">
+          Mismatch review unavailable
+        </div>
+        <CardTitle className="text-2xl text-white">
+          Cycle mismatches could not be loaded
+        </CardTitle>
+        <CardDescription className="text-sm leading-6 text-red-100/90">
+          {message}
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
+          <Link href="/lp/cycles">Back to cycles</Link>
         </Button>
       </CardContent>
     </Card>
@@ -518,37 +639,44 @@ function EmptyState({
   cycle,
   activeTab,
   counts,
-}: Extract<CycleMismatchState, { kind: "empty" }>) {
+}: Extract<LpCycleMismatchState, { kind: "empty" }>) {
   return (
     <div className="space-y-6">
+      <div className="grid gap-3 sm:grid-cols-3">
+        {(["open", "resolved", "waived"] as const).map((tab) => (
+          <Link
+            key={tab}
+            href={buildTabHref(cycle.id, tab)}
+            className={`rounded-2xl border px-4 py-4 text-left transition-colors ${
+              activeTab === tab
+                ? "border-cyan-400/30 bg-cyan-400/10"
+                : "border-white/10 bg-white/6 hover:bg-white/8"
+            }`}
+          >
+            <div className="text-xs uppercase tracking-[0.18em] text-slate-400">
+              {tab}
+            </div>
+            <div className="mt-2 text-3xl font-semibold text-white">
+              {counts[tab]}
+            </div>
+          </Link>
+        ))}
+      </div>
+
       <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
         <CardHeader className="space-y-2">
           <CardTitle className="text-2xl text-white">
-            {cycle.lpName} · {cycle.storeLocation}
+            {cycle.lpName} · {cycle.storeLocationName}
           </CardTitle>
           <CardDescription className="text-sm leading-6 text-slate-300">
-            {cycle.storeOrganization} · {formatMonthLabel(cycle.month)} ·{" "}
-            {cycle.cycleStatus.replaceAll("_", " ")}
+            {cycle.storeOrganizationName} · {formatMonthLabel(cycle.month)} ·{" "}
+            {formatEnumLabel(cycle.status)}
           </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-wrap gap-3">
-          {(["open", "resolved", "waived"] as ReviewTab[]).map((tab) => (
-            <Button
-              key={tab}
-              asChild
-              variant={activeTab === tab ? "default" : "outline"}
-              className={
-                activeTab === tab
-                  ? "bg-white text-slate-950 hover:bg-slate-100"
-                  : "border-white/15 bg-white/5 text-white hover:bg-white/10"
-              }
-            >
-              <Link href={buildTabHref(cycle.id, tab)}>
-                {tab[0]?.toUpperCase()}
-                {tab.slice(1)} ({counts[tab]})
-              </Link>
-            </Button>
-          ))}
+          <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
+            <Link href={`/lp/cycles/${cycle.id}`}>Back to cycle details</Link>
+          </Button>
         </CardContent>
       </Card>
 
@@ -561,311 +689,7 @@ function EmptyState({
             There are no {activeTab} mismatches for this reconciliation cycle.
           </CardDescription>
         </CardHeader>
-        <CardContent className="flex flex-wrap gap-3">
-          <Button
-            asChild
-            className="bg-white text-slate-950 hover:bg-slate-100"
-          >
-            <Link href={`/lp/cycles/${cycle.id}`}>Back to cycle details</Link>
-          </Button>
-          <Button
-            asChild
-            variant="outline"
-            className="border-white/15 bg-white/5 text-white hover:bg-white/10"
-          >
-            <Link href={`/lp/cycles/${cycle.id}/mismatches?view=open`}>
-              View open mismatches
-            </Link>
-          </Button>
-        </CardContent>
       </Card>
-    </div>
-  );
-}
-
-function ReadyState({
-  cycle,
-  activeTab,
-  mismatches,
-  selectedMismatch,
-  counts,
-}: Extract<CycleMismatchState, { kind: "ready" }>) {
-  return (
-    <div className="space-y-6">
-      <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
-        <CardHeader className="space-y-2">
-          <div className="inline-flex w-fit items-center rounded-full border border-cyan-400/20 bg-cyan-400/10 px-3 py-1 text-xs font-medium uppercase tracking-[0.18em] text-cyan-100">
-            VendorStream
-          </div>
-          <CardTitle className="text-3xl text-white">
-            {cycle.lpName} · {cycle.storeLocation}
-          </CardTitle>
-          <CardDescription className="text-sm leading-6 text-slate-300">
-            Review mismatches for {cycle.storeOrganization} in{" "}
-            {formatMonthLabel(cycle.month)}. Use the filtered queue and details
-            panel to prepare LP-side resolution decisions.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="grid gap-3 md:grid-cols-4">
-          <DetailRow
-            label="Cycle status"
-            value={cycle.cycleStatus.replaceAll("_", " ")}
-          />
-          <DetailRow label="Open" value={counts.open} />
-          <DetailRow label="Resolved" value={counts.resolved} />
-          <DetailRow label="Waived" value={counts.waived} />
-        </CardContent>
-      </Card>
-
-      <div className="flex flex-wrap gap-3">
-        {(["open", "resolved", "waived"] as ReviewTab[]).map((tab) => (
-          <Button
-            key={tab}
-            asChild
-            variant={activeTab === tab ? "default" : "outline"}
-            className={
-              activeTab === tab
-                ? "bg-white text-slate-950 hover:bg-slate-100"
-                : "border-white/15 bg-white/5 text-white hover:bg-white/10"
-            }
-          >
-            <Link href={buildTabHref(cycle.id, tab, selectedMismatch?.id)}>
-              {tab[0]?.toUpperCase()}
-              {tab.slice(1)} ({counts[tab]})
-            </Link>
-          </Button>
-        ))}
-      </div>
-
-      <div className="grid gap-4 xl:grid-cols-[1.35fr_0.65fr]">
-        <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
-          <CardHeader className="space-y-2">
-            <CardTitle className="text-xl text-white">Mismatch queue</CardTitle>
-            <CardDescription className="text-sm leading-6 text-slate-300">
-              Filtered mismatch list for this cycle. Select an item to inspect
-              barcode, source values, and placeholder resolution actions.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {mismatches.map((mismatch) => {
-              const isSelected = mismatch.id === selectedMismatch?.id;
-
-              return (
-                <div
-                  key={mismatch.id}
-                  className={`rounded-2xl border px-4 py-4 ${
-                    isSelected
-                      ? "border-cyan-400/30 bg-cyan-400/10"
-                      : "border-white/8 bg-slate-950/35"
-                  }`}
-                >
-                  <div className="grid gap-4 xl:grid-cols-[1fr_0.8fr_0.8fr_1.2fr_1fr_0.8fr_0.8fr_auto] xl:items-start">
-                    <div className="space-y-1">
-                      <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
-                        Mismatch type
-                      </div>
-                      <Badge
-                        label={formatMismatchType(mismatch.mismatchType)}
-                        className={getTypeTone(mismatch.mismatchType)}
-                      />
-                    </div>
-
-                    <div className="space-y-1">
-                      <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
-                        Status
-                      </div>
-                      <Badge
-                        label={mismatch.status}
-                        className={getStatusTone(mismatch.status)}
-                      />
-                    </div>
-
-                    <div className="space-y-1">
-                      <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
-                        Field name
-                      </div>
-                      <div className="text-sm text-white">
-                        {mismatch.fieldName}
-                      </div>
-                    </div>
-
-                    <div className="space-y-1">
-                      <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
-                        Message
-                      </div>
-                      <div className="text-sm leading-6 text-slate-300">
-                        {mismatch.message}
-                      </div>
-                    </div>
-
-                    <div className="space-y-1">
-                      <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
-                        Related barcode / product
-                      </div>
-                      <div className="text-sm text-slate-300">
-                        {mismatch.barcode ?? "N/A"}
-                      </div>
-                      <div className="text-sm text-white">
-                        {mismatch.productName ?? "No product linked"}
-                      </div>
-                    </div>
-
-                    <div className="space-y-1">
-                      <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
-                        Resolved by
-                      </div>
-                      <div className="text-sm text-slate-300">
-                        {mismatch.resolvedBy ?? "Pending"}
-                      </div>
-                    </div>
-
-                    <div className="space-y-1">
-                      <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
-                        Resolved at
-                      </div>
-                      <div className="text-sm text-slate-300">
-                        {mismatch.resolvedAt ?? "Pending"}
-                      </div>
-                    </div>
-
-                    <div className="flex justify-start xl:justify-end">
-                      <Button
-                        asChild
-                        size="sm"
-                        variant="outline"
-                        className="border-white/15 bg-white/5 text-white hover:bg-white/10"
-                      >
-                        <Link
-                          href={buildTabHref(cycle.id, activeTab, mismatch.id)}
-                        >
-                          Details
-                        </Link>
-                      </Button>
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-          </CardContent>
-        </Card>
-
-        <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
-          <CardHeader className="space-y-2">
-            <CardTitle className="text-xl text-white">Details panel</CardTitle>
-            <CardDescription className="text-sm leading-6 text-slate-300">
-              Review field-level context and prepare a future resolution action.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {selectedMismatch ? (
-              <>
-                <DetailRow
-                  label="Mismatch type"
-                  value={
-                    <Badge
-                      label={formatMismatchType(selectedMismatch.mismatchType)}
-                      className={getTypeTone(selectedMismatch.mismatchType)}
-                    />
-                  }
-                />
-                <DetailRow
-                  label="Status"
-                  value={
-                    <Badge
-                      label={selectedMismatch.status}
-                      className={getStatusTone(selectedMismatch.status)}
-                    />
-                  }
-                />
-                <DetailRow
-                  label="Field name"
-                  value={selectedMismatch.fieldName}
-                />
-                <DetailRow
-                  label="Barcode"
-                  value={selectedMismatch.barcode ?? "Not available"}
-                />
-                <DetailRow
-                  label="Product"
-                  value={selectedMismatch.productName ?? "Not available"}
-                />
-                <DetailRow
-                  label="LP value"
-                  value={selectedMismatch.lpValue ?? "Not available"}
-                />
-                <DetailRow
-                  label="Store value"
-                  value={selectedMismatch.storeValue ?? "Not available"}
-                />
-
-                <div className="rounded-xl border border-white/8 bg-slate-950/35 px-4 py-3">
-                  <div className="text-sm text-slate-400">Message</div>
-                  <div className="mt-1 text-sm leading-6 text-white">
-                    {selectedMismatch.message}
-                  </div>
-                </div>
-
-                <div className="rounded-xl border border-white/8 bg-slate-950/35 px-4 py-3">
-                  <div className="text-sm text-slate-400">Comments</div>
-                  <div className="mt-2 space-y-2">
-                    {selectedMismatch.comments.length > 0 ? (
-                      selectedMismatch.comments.map((comment) => (
-                        <div
-                          key={comment}
-                          className="text-sm leading-6 text-white"
-                        >
-                          {comment}
-                        </div>
-                      ))
-                    ) : (
-                      <div className="text-sm text-slate-300">
-                        No comments recorded yet.
-                      </div>
-                    )}
-                  </div>
-                </div>
-
-                <div className="rounded-xl border border-white/8 bg-slate-950/35 px-4 py-3">
-                  <div className="text-sm text-slate-400">
-                    Resolution summary
-                  </div>
-                  <div className="mt-1 text-sm leading-6 text-white">
-                    {selectedMismatch.resolutionSummary ??
-                      "No resolution has been recorded for this mismatch."}
-                  </div>
-                </div>
-
-                <div className="space-y-3 rounded-2xl border border-dashed border-white/15 bg-slate-950/25 px-4 py-4">
-                  <div className="text-sm font-medium text-white">
-                    Placeholder resolution actions
-                  </div>
-                  <div className="grid gap-2">
-                    {selectedMismatch.availableActions.map((action) => (
-                      <Button
-                        key={action}
-                        type="button"
-                        variant="outline"
-                        disabled
-                        className="justify-start border-white/15 bg-white/5 text-white disabled:opacity-70"
-                      >
-                        {action}
-                      </Button>
-                    ))}
-                  </div>
-                  <div className="text-xs leading-5 text-slate-400">
-                    These actions are placeholders until the mismatch resolution
-                    API and audit logging flow are connected.
-                  </div>
-                </div>
-              </>
-            ) : (
-              <div className="rounded-xl border border-white/8 bg-slate-950/35 px-4 py-6 text-sm text-slate-300">
-                Select a mismatch to view details.
-              </div>
-            )}
-          </CardContent>
-        </Card>
-      </div>
     </div>
   );
 }
@@ -878,11 +702,13 @@ export default async function LpCycleMismatchesPage({
   searchParams?: Promise<{
     view?: string;
     mismatchId?: string;
+    mutation?: string;
   }>;
 }) {
   const { cycleId } = await params;
   const resolvedSearchParams = searchParams ? await searchParams : undefined;
-  const state = await getCycleMismatchState(cycleId, resolvedSearchParams);
+  const state = await getLpCycleMismatchState(cycleId, resolvedSearchParams);
+  const mutationBanner = getMutationBanner(resolvedSearchParams?.mutation);
 
   return (
     <main className="relative min-h-screen overflow-hidden bg-[#06111f] text-white">
@@ -900,37 +726,372 @@ export default async function LpCycleMismatchesPage({
           </div>
           <div className="space-y-2">
             <h1 className="text-4xl font-semibold tracking-tight text-white sm:text-5xl">
-              Reconciliation mismatch operations
+              Cycle mismatches
             </h1>
             <p className="max-w-3xl text-sm leading-7 text-slate-300 sm:text-base">
-              Review cycle-level mismatches, inspect field comparisons, and
-              prepare resolution decisions for LP-side reconciliation workflows.
+              Review cycle-level mismatches from the LP side, inspect resolution
+              history, and prepare future resolution actions.
             </p>
           </div>
         </header>
 
-        {state.kind === "loading" ? <LoadingState /> : null}
-        {state.kind === "error" ? <ErrorState message={state.message} /> : null}
-        {state.kind === "missing" ? (
-          <MissingState cycleId={state.cycleId} />
+        {mutationBanner ? (
+          <div
+            className={`rounded-2xl border px-4 py-4 text-sm leading-6 ${
+              mutationBanner.tone === "success"
+                ? "border-emerald-400/20 bg-emerald-500/10 text-emerald-100"
+                : "border-amber-400/20 bg-amber-500/10 text-amber-100"
+            }`}
+          >
+            {mutationBanner.message}
+          </div>
         ) : null}
+
+        {state.kind === "missing" ? <MissingState cycleId={state.cycleId} /> : null}
+        {state.kind === "forbidden" ? <ForbiddenState /> : null}
+        {state.kind === "error" ? <ErrorState message={state.message} /> : null}
         {state.kind === "empty" ? (
           <EmptyState
             kind="empty"
             cycle={state.cycle}
             activeTab={state.activeTab}
             counts={state.counts}
+            canManageResolutions={state.canManageResolutions}
           />
         ) : null}
+
         {state.kind === "ready" ? (
-          <ReadyState
-            kind="ready"
-            cycle={state.cycle}
-            activeTab={state.activeTab}
-            mismatches={state.mismatches}
-            selectedMismatch={state.selectedMismatch}
-            counts={state.counts}
-          />
+          <div className="space-y-6">
+            <div className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
+              <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
+                <CardHeader className="space-y-3">
+                  <div className="flex flex-wrap items-center gap-3">
+                    <div className="inline-flex items-center rounded-full border border-cyan-400/20 bg-cyan-400/10 px-3 py-1 text-xs font-medium uppercase tracking-[0.18em] text-cyan-100">
+                      {formatMonthLabel(state.cycle.month)}
+                    </div>
+                    <StatusBadge
+                      label={formatEnumLabel(state.cycle.status)}
+                      className="border-white/10 bg-white/5 text-slate-200"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <CardTitle className="text-3xl text-white">
+                      {state.cycle.lpName}
+                    </CardTitle>
+                    <CardDescription className="text-sm leading-6 text-slate-300">
+                      {state.cycle.storeOrganizationName} ·{" "}
+                      {state.cycle.storeLocationName}
+                    </CardDescription>
+                  </div>
+                </CardHeader>
+                <CardContent className="grid gap-3 lg:grid-cols-2">
+                  <DetailRow label="Cycle ID" value={state.cycle.id} />
+                  <DetailRow
+                    label="Month"
+                    value={formatMonthLabel(state.cycle.month)}
+                  />
+                  <DetailRow label="LP" value={state.cycle.lpName} />
+                  <DetailRow
+                    label="Store organization"
+                    value={state.cycle.storeOrganizationName}
+                  />
+                  <DetailRow
+                    label="Store location"
+                    value={state.cycle.storeLocationName}
+                  />
+                  <DetailRow
+                    label="Cycle status"
+                    value={formatEnumLabel(state.cycle.status)}
+                  />
+                </CardContent>
+              </Card>
+
+              <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
+                <CardHeader className="space-y-2">
+                  <CardTitle className="text-xl text-white">Mismatch counts</CardTitle>
+                  <CardDescription className="text-sm leading-6 text-slate-300">
+                    Current cycle-level mismatch totals by review state.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="grid gap-4 sm:grid-cols-3">
+                  {(["open", "resolved", "waived"] as const).map((tab) => (
+                    <Link
+                      key={tab}
+                      href={buildTabHref(state.cycle.id, tab)}
+                      className={`rounded-2xl border px-4 py-4 text-left transition-colors ${
+                        state.activeTab === tab
+                          ? "border-cyan-400/30 bg-cyan-400/10"
+                          : "border-white/10 bg-white/6 hover:bg-white/8"
+                      }`}
+                    >
+                      <div className="text-xs uppercase tracking-[0.18em] text-slate-400">
+                        {tab}
+                      </div>
+                      <div className="mt-2 text-3xl font-semibold text-white">
+                        {state.counts[tab]}
+                      </div>
+                    </Link>
+                  ))}
+                </CardContent>
+              </Card>
+            </div>
+
+            <div className="grid gap-4 xl:grid-cols-[1.25fr_0.75fr]">
+              <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
+                <CardHeader className="space-y-2">
+                  <CardTitle className="text-xl text-white">Mismatch records</CardTitle>
+                  <CardDescription className="text-sm leading-6 text-slate-300">
+                    Real mismatch rows for the current cycle and selected review
+                    tab.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-3">
+                  {state.rows.map((row) => (
+                    <div
+                      key={row.id}
+                      className={`rounded-2xl border px-4 py-4 ${
+                        row.id === state.selectedMismatch?.id
+                          ? "border-cyan-400/30 bg-cyan-400/10"
+                          : "border-white/8 bg-slate-950/35"
+                      }`}
+                    >
+                      <div className="grid gap-4 xl:grid-cols-[0.9fr_0.7fr_0.8fr_1.2fr_1fr_0.8fr_0.8fr_auto] xl:items-start">
+                        <div className="space-y-1">
+                          <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
+                            Type
+                          </div>
+                          <StatusBadge
+                            label={formatEnumLabel(row.type)}
+                            className={getTypeTone(row.type)}
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
+                            Status
+                          </div>
+                          <StatusBadge
+                            label={formatEnumLabel(row.status)}
+                            className={getMismatchStatusBadgeClassName(row.status)}
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
+                            Field name
+                          </div>
+                          <div className="text-sm text-slate-300">
+                            {row.fieldName ?? "Not available"}
+                          </div>
+                        </div>
+                        <div className="space-y-1">
+                          <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
+                            Message
+                          </div>
+                          <div className="text-sm text-slate-300">
+                            {row.message}
+                          </div>
+                        </div>
+                        <div className="space-y-1">
+                          <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
+                            Barcode / product
+                          </div>
+                          <div className="text-sm text-slate-300">
+                            {row.barcode ?? "No barcode"}
+                            <div className="text-xs text-slate-500">
+                              {row.productName ?? "No product name"}
+                            </div>
+                          </div>
+                        </div>
+                        <div className="space-y-1">
+                          <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
+                            Resolved by
+                          </div>
+                          <div className="text-sm text-slate-300">
+                            {row.resolvedBy ?? "Not resolved"}
+                          </div>
+                        </div>
+                        <div className="space-y-1">
+                          <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
+                            Resolved at
+                          </div>
+                          <div className="text-sm text-slate-300">
+                            {formatDateTime(row.resolvedAt)}
+                          </div>
+                        </div>
+                        <div className="flex flex-wrap gap-2 xl:justify-end">
+                          <Button
+                            asChild
+                            size="sm"
+                            variant="outline"
+                            className="border-white/15 bg-white/5 text-white hover:bg-white/10"
+                          >
+                            <Link
+                              href={buildTabHref(
+                                state.cycle.id,
+                                state.activeTab,
+                                row.id,
+                              )}
+                            >
+                              View details
+                            </Link>
+                          </Button>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </CardContent>
+              </Card>
+
+              <div className="space-y-4">
+                <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
+                  <CardHeader className="space-y-2">
+                    <CardTitle className="text-xl text-white">
+                      Selected mismatch
+                    </CardTitle>
+                    <CardDescription className="text-sm leading-6 text-slate-300">
+                      Focused detail view for the currently selected mismatch
+                      row.
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className="space-y-3">
+                    {state.selectedMismatch ? (
+                      <>
+                        <DetailRow label="Mismatch ID" value={state.selectedMismatch.id} />
+                        <DetailRow
+                          label="Type"
+                          value={
+                            <StatusBadge
+                              label={formatEnumLabel(state.selectedMismatch.type)}
+                              className={getTypeTone(state.selectedMismatch.type)}
+                            />
+                          }
+                        />
+                        <DetailRow
+                          label="Status"
+                          value={
+                            <StatusBadge
+                              label={formatEnumLabel(state.selectedMismatch.status)}
+                              className={getMismatchStatusBadgeClassName(
+                                state.selectedMismatch.status,
+                              )}
+                            />
+                          }
+                        />
+                        <DetailRow
+                          label="Field name"
+                          value={
+                            state.selectedMismatch.fieldName ?? "Not available"
+                          }
+                        />
+                        <DetailRow
+                          label="Barcode"
+                          value={state.selectedMismatch.barcode ?? "Not available"}
+                        />
+                        <DetailRow
+                          label="Product"
+                          value={
+                            state.selectedMismatch.productName ?? "Not available"
+                          }
+                        />
+                        <DetailRow
+                          label="Resolved by"
+                          value={
+                            state.selectedMismatch.resolvedBy ?? "Not resolved"
+                          }
+                        />
+                        <DetailRow
+                          label="Resolved at"
+                          value={formatDateTime(state.selectedMismatch.resolvedAt)}
+                        />
+                        <div className="rounded-2xl border border-white/8 bg-slate-950/35 px-4 py-4">
+                          <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
+                            Message
+                          </div>
+                          <div className="mt-2 text-sm leading-6 text-slate-300">
+                            {state.selectedMismatch.message}
+                          </div>
+                        </div>
+                        <div className="rounded-2xl border border-white/8 bg-slate-950/35 px-4 py-4">
+                          <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
+                            Details
+                          </div>
+                          <pre className="mt-2 overflow-x-auto text-xs leading-6 text-slate-300">
+                            {JSON.stringify(state.selectedMismatch.details, null, 2) ||
+                              "No structured details available."}
+                          </pre>
+                        </div>
+                        <MismatchResolutionForm
+                          mismatchId={state.selectedMismatch.id}
+                          mismatchStatus={state.selectedMismatch.status}
+                          canManage={state.canManageResolutions}
+                          action={submitLpMismatchResolution}
+                          hiddenFields={{
+                            cycleId: state.cycle.id,
+                            currentView: state.activeTab,
+                          }}
+                        />
+                      </>
+                    ) : null}
+                  </CardContent>
+                </Card>
+
+                <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
+                  <CardHeader className="space-y-2">
+                    <CardTitle className="text-xl text-white">
+                      Resolution history
+                    </CardTitle>
+                    <CardDescription className="text-sm leading-6 text-slate-300">
+                      Latest recorded resolution events for the selected
+                      mismatch.
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className="space-y-3">
+                    {state.selectedMismatch?.resolutions.length ? (
+                      state.selectedMismatch.resolutions.map((resolution) => (
+                        <div
+                          key={resolution.id}
+                          className="rounded-2xl border border-white/8 bg-slate-950/35 px-4 py-4"
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-3">
+                            <StatusBadge
+                              label={formatEnumLabel(resolution.action)}
+                              className="border-cyan-400/20 bg-cyan-400/10 text-cyan-100"
+                            />
+                            <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
+                              {formatDateTime(resolution.createdAt)}
+                            </div>
+                          </div>
+                          <div className="mt-3 text-sm text-slate-300">
+                            Created by {resolution.createdBy}
+                          </div>
+                          <div className="mt-2 text-sm leading-6 text-slate-300">
+                            {resolution.comment ?? "No comment recorded."}
+                          </div>
+                          {resolution.payload !== null ? (
+                            <pre className="mt-3 overflow-x-auto rounded-xl border border-white/8 bg-slate-950/50 p-3 text-xs leading-6 text-slate-300">
+                              {JSON.stringify(resolution.payload, null, 2)}
+                            </pre>
+                          ) : null}
+                        </div>
+                      ))
+                    ) : (
+                      <div className="rounded-2xl border border-dashed border-white/15 bg-slate-950/30 px-4 py-5 text-sm text-slate-400">
+                        No resolution history has been recorded yet for this
+                        mismatch.
+                      </div>
+                    )}
+                  </CardContent>
+                </Card>
+
+                <div className="flex flex-wrap gap-3">
+                  <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
+                    <Link href={`/lp/cycles/${state.cycle.id}`}>
+                      Back to cycle details
+                    </Link>
+                  </Button>
+                </div>
+              </div>
+            </div>
+          </div>
         ) : null}
       </div>
     </main>

@@ -3,6 +3,8 @@ import { getServerSession } from "next-auth";
 import { redirect } from "next/navigation";
 import { prisma, type StatementStatus } from "@vendorstream/database";
 import { authOptions } from "@/app/api/auth/[...nextauth]/options";
+import { PageErrorState } from "@/components/page-error-state";
+import { formatMonthLabel } from "@/lib/format";
 import { getStoreUploadContextForUser } from "@/lib/store-upload-context";
 import {
   Card,
@@ -71,10 +73,7 @@ type StoreStatementDetailsState =
     };
 
 function formatMonth(date: Date) {
-  return new Intl.DateTimeFormat("en-US", {
-    month: "long",
-    year: "numeric",
-  }).format(date);
+  return formatMonthLabel(date);
 }
 
 function formatDateTime(date: Date | null) {
@@ -366,7 +365,9 @@ async function getStoreStatementDetailsState(
 
     const isAdmin = session.user.systemRole === "ADMIN";
     const allowedPairs = new Set(
-      context.options.map((option) => `${option.lpId}:${option.storeLocationId}`),
+      context.options.map(
+        (option) => `${option.lpId}:${option.storeLocationId}`,
+      ),
     );
     const pairKey = `${statement.cycle.lpId}:${statement.cycle.storeLocation.id}`;
 
@@ -434,85 +435,6 @@ async function getStoreStatementDetailsState(
   }
 }
 
-function MissingState({ statementId }: { statementId: string }) {
-  return (
-    <Card className="border border-amber-400/20 bg-amber-500/8 shadow-2xl backdrop-blur-xl">
-      <CardHeader className="space-y-3">
-        <div className="inline-flex w-fit items-center rounded-full border border-amber-400/30 bg-amber-500/10 px-3 py-1 text-xs font-medium uppercase tracking-[0.18em] text-amber-100">
-          Statement not found
-        </div>
-        <CardTitle className="text-2xl text-white">
-          No store-visible statement matched this identifier
-        </CardTitle>
-        <CardDescription className="text-sm leading-6 text-amber-100/90">
-          The statement ID{" "}
-          <span className="font-medium text-white">{statementId}</span> is not
-          available in the current store workspace.
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="flex flex-wrap gap-3">
-        <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
-          <Link href="/store/statements">Back to statements</Link>
-        </Button>
-      </CardContent>
-    </Card>
-  );
-}
-
-function ForbiddenState() {
-  return (
-    <Card className="border border-red-400/20 bg-red-500/8 shadow-2xl backdrop-blur-xl">
-      <CardHeader className="space-y-3">
-        <div className="inline-flex w-fit items-center rounded-full border border-red-400/30 bg-red-500/10 px-3 py-1 text-xs font-medium uppercase tracking-[0.18em] text-red-100">
-          Access restricted
-        </div>
-        <CardTitle className="text-2xl text-white">
-          You do not have access to this statement
-        </CardTitle>
-        <CardDescription className="text-sm leading-6 text-red-100/90">
-          This statement does not belong to a store location in your current
-          access scope.
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="flex flex-wrap gap-3">
-        <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
-          <Link href="/store/statements">Back to statements</Link>
-        </Button>
-      </CardContent>
-    </Card>
-  );
-}
-
-function ErrorState({ message }: { message: string }) {
-  return (
-    <Card className="border border-red-400/20 bg-red-500/8 shadow-2xl backdrop-blur-xl">
-      <CardHeader className="space-y-3">
-        <div className="inline-flex w-fit items-center rounded-full border border-red-400/30 bg-red-500/10 px-3 py-1 text-xs font-medium uppercase tracking-[0.18em] text-red-100">
-          Statement unavailable
-        </div>
-        <CardTitle className="text-2xl text-white">
-          Store statement details could not be loaded
-        </CardTitle>
-        <CardDescription className="text-sm leading-6 text-red-100/90">
-          {message}
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="flex flex-wrap gap-3">
-        <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
-          <Link href="/store/statements">Back to statements</Link>
-        </Button>
-        <Button
-          asChild
-          variant="outline"
-          className="border-white/15 bg-white/5 text-white hover:bg-white/10"
-        >
-          <Link href="/store/dashboard">Back to store dashboard</Link>
-        </Button>
-      </CardContent>
-    </Card>
-  );
-}
-
 export default async function StoreStatementDetailsPage({
   params,
 }: {
@@ -533,19 +455,78 @@ export default async function StoreStatementDetailsPage({
               Statement details
             </h1>
             <p className="max-w-3xl text-sm leading-7 text-slate-300 sm:text-base">
-              Review the full store-visible statement, including totals, generated
-              file metadata, and reconciled line items.
+              Review the full store-visible statement, including totals,
+              generated file metadata, and reconciled line items.
             </p>
           </div>
         </header>
 
         {state.kind === "missing" ? (
-          <MissingState statementId={state.statementId} />
+          <PageErrorState
+            variant="missing"
+            badgeLabel="Statement not found"
+            title="No store-visible statement matched this identifier"
+            description={
+              <>
+                The statement ID{" "}
+                <span className="font-medium text-white">
+                  {state.statementId}
+                </span>{" "}
+                is not available in the current store workspace.
+              </>
+            }
+            actions={
+              <Button
+                asChild
+                className="bg-white text-slate-950 hover:bg-slate-100"
+              >
+                <Link href="/store/statements">Back to statements</Link>
+              </Button>
+            }
+          />
         ) : null}
 
-        {state.kind === "forbidden" ? <ForbiddenState /> : null}
+        {state.kind === "forbidden" ? (
+          <PageErrorState
+            variant="forbidden"
+            title="You do not have access to this statement"
+            description="This statement does not belong to a store location in your current access scope."
+            actions={
+              <Button
+                asChild
+                className="bg-white text-slate-950 hover:bg-slate-100"
+              >
+                <Link href="/store/statements">Back to statements</Link>
+              </Button>
+            }
+          />
+        ) : null}
 
-        {state.kind === "error" ? <ErrorState message={state.message} /> : null}
+        {state.kind === "error" ? (
+          <PageErrorState
+            variant="error"
+            badgeLabel="Statement unavailable"
+            title="Store statement details could not be loaded"
+            description={state.message}
+            actions={
+              <>
+                <Button
+                  asChild
+                  className="bg-white text-slate-950 hover:bg-slate-100"
+                >
+                  <Link href="/store/statements">Back to statements</Link>
+                </Button>
+                <Button
+                  asChild
+                  variant="outline"
+                  className="border-white/15 bg-white/5 text-white hover:bg-white/10"
+                >
+                  <Link href="/store/dashboard">Back to store dashboard</Link>
+                </Button>
+              </>
+            }
+          />
+        ) : null}
 
         {state.kind === "ready" ? (
           <div className="space-y-6">
@@ -563,7 +544,8 @@ export default async function StoreStatementDetailsPage({
                   </div>
                   <div className="space-y-2">
                     <CardTitle className="text-3xl text-white">
-                      {state.statement.lpName} · {state.statement.storeLocationName}
+                      {state.statement.lpName} ·{" "}
+                      {state.statement.storeLocationName}
                     </CardTitle>
                     <CardDescription className="text-sm leading-6 text-slate-300">
                       Statement version v{state.statement.version} for{" "}
@@ -613,8 +595,8 @@ export default async function StoreStatementDetailsPage({
                 <CardHeader className="space-y-2">
                   <CardTitle className="text-xl text-white">Actions</CardTitle>
                   <CardDescription className="text-sm leading-6 text-slate-300">
-                    Continue from this statement into the related cycle or statement
-                    history.
+                    Continue from this statement into the related cycle or
+                    statement history.
                   </CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-3">
@@ -631,7 +613,10 @@ export default async function StoreStatementDetailsPage({
                     }
                   />
                   <div className="flex flex-wrap gap-3 pt-2">
-                    <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
+                    <Button
+                      asChild
+                      className="bg-white text-slate-950 hover:bg-slate-100"
+                    >
                       <Link href="/store/statements">Back to statements</Link>
                     </Button>
                     <Button
@@ -729,7 +714,9 @@ export default async function StoreStatementDetailsPage({
                   />
                   <DetailRow
                     label="Bucket"
-                    value={state.statement.generatedFile?.bucket ?? "Not available"}
+                    value={
+                      state.statement.generatedFile?.bucket ?? "Not available"
+                    }
                   />
                   <DetailRow
                     label="Storage path"
@@ -740,24 +727,40 @@ export default async function StoreStatementDetailsPage({
                   />
                   <div className="rounded-2xl border border-cyan-400/20 bg-cyan-400/10 px-4 py-4 text-sm leading-6 text-cyan-100">
                     {state.statement.generatedFile
-                      ? "A generated file is linked to this statement, but a signed file-delivery route is not wired yet."
+                      ? "A generated file is linked and can be downloaded via a short-lived signed URL."
                       : "This statement does not have a generated file attached yet."}
                   </div>
                   <div className="flex flex-wrap gap-3 pt-2">
                     <Button
-                      type="button"
-                      disabled
+                      asChild={Boolean(state.statement.generatedFile)}
+                      disabled={!state.statement.generatedFile}
                       className="bg-white text-slate-950 hover:bg-slate-100 disabled:bg-white/20 disabled:text-slate-400"
                     >
-                      Download statement file
+                      {state.statement.generatedFile ? (
+                        <Link
+                          href={`/api/statements/${state.statement.id}/download`}
+                        >
+                          Download statement file
+                        </Link>
+                      ) : (
+                        <span>Download statement file</span>
+                      )}
                     </Button>
                     <Button
-                      type="button"
+                      asChild={Boolean(state.statement.generatedFile)}
                       variant="outline"
-                      disabled
+                      disabled={!state.statement.generatedFile}
                       className="border-white/15 bg-white/5 text-white disabled:text-slate-500"
                     >
-                      Open file
+                      {state.statement.generatedFile ? (
+                        <Link
+                          href={`/api/statements/${state.statement.id}/download`}
+                        >
+                          Open file
+                        </Link>
+                      ) : (
+                        <span>Open file</span>
+                      )}
                     </Button>
                   </div>
                 </CardContent>
@@ -769,11 +772,15 @@ export default async function StoreStatementDetailsPage({
                     Statement context
                   </CardTitle>
                   <CardDescription className="text-sm leading-6 text-slate-300">
-                    Operational metadata tied to this generated statement version.
+                    Operational metadata tied to this generated statement
+                    version.
                   </CardDescription>
                 </CardHeader>
                 <CardContent className="grid gap-3">
-                  <DetailRow label="Currency" value={state.statement.currency} />
+                  <DetailRow
+                    label="Currency"
+                    value={state.statement.currency}
+                  />
                   <DetailRow
                     label="Created at"
                     value={formatDateTime(state.statement.createdAt)}
@@ -811,7 +818,8 @@ export default async function StoreStatementDetailsPage({
                   Statement line items
                 </CardTitle>
                 <CardDescription className="text-sm leading-6 text-slate-300">
-                  Reconciled line-item detail included in this statement version.
+                  Reconciled line-item detail included in this statement
+                  version.
                 </CardDescription>
               </CardHeader>
               <CardContent>
@@ -821,7 +829,9 @@ export default async function StoreStatementDetailsPage({
                       <thead className="border-b border-white/8 bg-white/5">
                         <tr className="text-xs uppercase tracking-[0.16em] text-slate-400">
                           <th className="px-4 py-3 font-medium">Barcode</th>
-                          <th className="px-4 py-3 font-medium">Product name</th>
+                          <th className="px-4 py-3 font-medium">
+                            Product name
+                          </th>
                           <th className="px-4 py-3 font-medium">Category</th>
                           <th className="px-4 py-3 font-medium">
                             Reconciled units

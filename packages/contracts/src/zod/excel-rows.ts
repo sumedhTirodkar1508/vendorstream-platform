@@ -14,6 +14,33 @@ const numericPreprocessor = (val: unknown) => {
 // ==========================================
 // LP MONTHLY SALES ROW SCHEMA
 // ==========================================
+export const LP_EXCEL_REQUIRED_HEADERS = [
+  "SKU",
+  "Item Name",
+  "Sub Category",
+  "Brand",
+  "Vendor ID",
+  "Vendor Name",
+  "Store Name",
+  "Store Address",
+  "Order Date",
+  "Units Sold",
+  "Item Barcode",
+] as const;
+
+export const STORE_EXCEL_REQUIRED_HEADERS = [
+  "SubCategory",
+  "SubSubCategory",
+  "Supplier/LP",
+  "Brand",
+  "Item Name",
+  "SKU",
+  "Sales ($)",
+  "Sales Units",
+  "OCS.ca Sales Price ($) Exclude Tax",
+  "Barcode/UPC",
+] as const;
+
 export const LpExcelRowSchema = z.object({
   SKU: z.coerce.string().optional(), // Fallback match (Rule 5.3)
   "Item Name": z.coerce.string().optional(),

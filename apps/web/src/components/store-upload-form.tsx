@@ -8,6 +8,7 @@ import {
   MAX_IMPORT_UPLOAD_FILE_SIZE_BYTES,
   type UploadSourceType,
 } from "@/lib/import-upload";
+import { formatMonthLabel as sharedFormatMonthLabel } from "@/lib/format";
 import type { StoreUploadAssignmentOption } from "@/lib/store-upload-context";
 import {
   Card,
@@ -46,13 +47,7 @@ function formatMonthLabel(value: string) {
     return "Select month";
   }
 
-  const [year, month] = value.split("-");
-  const parsedDate = new Date(Number(year), Number(month) - 1, 1);
-
-  return new Intl.DateTimeFormat("en-US", {
-    month: "long",
-    year: "numeric",
-  }).format(parsedDate);
+  return sharedFormatMonthLabel(value);
 }
 
 function isAcceptedFile(file: File) {

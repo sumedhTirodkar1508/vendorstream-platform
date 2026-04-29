@@ -7,7 +7,10 @@ import {
   type ImportBatchStatus,
   type StatementStatus,
 } from "@vendorstream/database";
+import { RefreshCw } from "lucide-react";
 import { authOptions } from "@/app/api/auth/[...nextauth]/options";
+import { EmptyState as AppEmptyState } from "@/components/empty-state";
+import { StatusBadge } from "@/components/ui/status-badge";
 import { getLpAccessContextForUser } from "@/lib/lp-access-context";
 import {
   Card,
@@ -17,6 +20,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { formatMonthLabel } from "@/lib/formatting";
 
 type UploadState = "NOT_UPLOADED" | "UPLOADED" | "VALIDATING" | "FAILED";
 type StatementState = "NOT_READY" | "PENDING" | "GENERATING" | "READY" | "FAILED";
@@ -80,13 +84,6 @@ const STATUS_OPTIONS: CycleStatus[] = [
   "STATEMENT_READY",
   "FAILED",
 ];
-
-function formatMonthLabel(value: Date) {
-  return new Intl.DateTimeFormat("en-US", {
-    month: "long",
-    year: "numeric",
-  }).format(value);
-}
 
 function getCycleStatusTone(status: CycleStatus) {
   if (status === "STATEMENT_READY" || status === "RECONCILIATION_PASSED") {
@@ -374,22 +371,6 @@ async function getLpCyclesState(searchParams?: {
   }
 }
 
-function Badge({
-  label,
-  className,
-}: {
-  label: string;
-  className: string;
-}) {
-  return (
-    <span
-      className={`inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-medium ${className}`}
-    >
-      {label}
-    </span>
-  );
-}
-
 function FilterForm({
   filters,
   storeLocations,
@@ -565,37 +546,36 @@ function EmptyState({
         </div>
       ) : null}
 
-      <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
-        <CardHeader className="space-y-2">
-          <CardTitle className="text-2xl text-white">
-            No reconciliation cycles found
-          </CardTitle>
-          <CardDescription className="text-sm leading-6 text-slate-300">
-            {isAccessEmpty
-              ? "This account is not assigned to any LP workspace yet."
-              : hasFilters
-                ? "No cycle rows match the current filters."
-                : `There are no reconciliation cycles yet for ${lpName}.`}
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="flex flex-wrap gap-3">
-          <Button
-            asChild
-            className="bg-white text-slate-950 hover:bg-slate-100"
-          >
-            <Link href="/lp/uploads/new">Upload Monthly File</Link>
-          </Button>
-          {hasFilters ? (
+      <AppEmptyState
+        icon={<RefreshCw className="h-5 w-5" />}
+        title="No reconciliation cycles found"
+        description={
+          isAccessEmpty
+            ? "This account is not assigned to any LP workspace yet."
+            : hasFilters
+              ? "No cycle rows match the current filters."
+              : `There are no reconciliation cycles yet for ${lpName}.`
+        }
+        actions={
+          <>
             <Button
               asChild
-              variant="outline"
-              className="border-white/15 bg-white/5 text-white hover:bg-white/10"
+              className="bg-white text-slate-950 hover:bg-slate-100"
             >
-              <Link href="/lp/cycles">Clear filters</Link>
+              <Link href="/lp/uploads/new">Upload Monthly File</Link>
             </Button>
-          ) : null}
-        </CardContent>
-      </Card>
+            {hasFilters ? (
+              <Button
+                asChild
+                variant="outline"
+                className="border-white/15 bg-white/5 text-white hover:bg-white/10"
+              >
+                <Link href="/lp/cycles">Clear filters</Link>
+              </Button>
+            ) : null}
+          </>
+        }
+      />
     </div>
   );
 }
@@ -665,7 +645,7 @@ function ReadyState({
                   <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
                     Cycle status
                   </div>
-                  <Badge
+                  <StatusBadge
                     label={row.cycleStatus.replaceAll("_", " ")}
                     className={getCycleStatusTone(row.cycleStatus)}
                   />
@@ -675,7 +655,7 @@ function ReadyState({
                   <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
                     LP upload
                   </div>
-                  <Badge
+                  <StatusBadge
                     label={row.lpUploadStatus.replaceAll("_", " ")}
                     className={getUploadStatusTone(row.lpUploadStatus)}
                   />
@@ -685,7 +665,7 @@ function ReadyState({
                   <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
                     Store upload
                   </div>
-                  <Badge
+                  <StatusBadge
                     label={row.storeUploadStatus.replaceAll("_", " ")}
                     className={getUploadStatusTone(row.storeUploadStatus)}
                   />
@@ -702,7 +682,7 @@ function ReadyState({
                   <div className="text-xs uppercase tracking-[0.16em] text-slate-500">
                     Statement status
                   </div>
-                  <Badge
+                  <StatusBadge
                     label={row.statementStatus.replaceAll("_", " ")}
                     className={getStatementStatusTone(row.statementStatus)}
                   />

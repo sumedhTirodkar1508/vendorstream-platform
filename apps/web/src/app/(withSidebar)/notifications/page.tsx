@@ -7,7 +7,10 @@ import {
   type NotificationStatus,
   type NotificationType,
 } from "@vendorstream/database";
+import { BellOff } from "lucide-react";
 import { authOptions } from "@/app/api/auth/[...nextauth]/options";
+import { EmptyState as AppEmptyState } from "@/components/empty-state";
+import { StatusBadge } from "@/components/ui/status-badge";
 import {
   Card,
   CardContent,
@@ -16,6 +19,8 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { formatDateTime, formatEnumLabel } from "@/lib/format";
+import { getNotificationStatusBadgeClassName } from "@/lib/status-badges";
 
 type NotificationFilters = {
   type: string;
@@ -76,24 +81,6 @@ const NOTIFICATION_STATUS_OPTIONS: NotificationStatus[] = [
   "FAILED",
 ];
 
-function formatDateTime(date: Date | null) {
-  if (!date) {
-    return "Not available";
-  }
-
-  return new Intl.DateTimeFormat("en-US", {
-    month: "short",
-    day: "numeric",
-    year: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-  }).format(date);
-}
-
-function formatEnumLabel(value: string) {
-  return value.replaceAll("_", " ");
-}
-
 function buildNotificationsHref(filters: NotificationFilters) {
   const params = new URLSearchParams();
 
@@ -113,44 +100,12 @@ function buildNotificationsHref(filters: NotificationFilters) {
   return query ? `/notifications?${query}` : "/notifications";
 }
 
-function getStatusTone(status: NotificationStatus) {
-  if (status === "SENT") {
-    return "border-emerald-400/30 bg-emerald-500/10 text-emerald-100";
-  }
-
-  if (status === "FAILED") {
-    return "border-red-400/30 bg-red-500/10 text-red-100";
-  }
-
-  if (status === "PENDING") {
-    return "border-amber-400/30 bg-amber-500/10 text-amber-100";
-  }
-
-  return "border-white/10 bg-white/5 text-slate-200";
-}
-
 function formatPayload(payload: Prisma.JsonValue | null) {
   if (payload === null) {
     return "No payload recorded.";
   }
 
   return JSON.stringify(payload, null, 2);
-}
-
-function StatusBadge({
-  label,
-  className,
-}: {
-  label: string;
-  className: string;
-}) {
-  return (
-    <span
-      className={`inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-medium ${className}`}
-    >
-      {label}
-    </span>
-  );
 }
 
 function DetailRow({
@@ -448,38 +403,37 @@ function EmptyState({
         </CardContent>
       </Card>
 
-      <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
-        <CardHeader className="space-y-2">
-          <CardTitle className="text-2xl text-white">
-            No notifications found
-          </CardTitle>
-          <CardDescription className="text-sm leading-6 text-slate-300">
-            {hasFilters
-              ? "No notifications match the current filter set."
-              : "No notifications are currently available for this account."}
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="flex flex-wrap gap-3">
-          <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
-            <Link href="/dashboard">Back to dashboard</Link>
-          </Button>
-          <Button
-            asChild
-            variant="outline"
-            className="border-white/15 bg-white/5 text-white hover:bg-white/10"
-          >
-            <Link
-              href={buildNotificationsHref({
-                type: "",
-                status: "",
-                notificationId: "",
-              })}
+      <AppEmptyState
+        icon={<BellOff className="h-5 w-5" />}
+        title="No notifications found"
+        description={
+          hasFilters
+            ? "No notifications match the current filter set."
+            : "No notifications are currently available for this account."
+        }
+        actions={
+          <>
+            <Button asChild className="bg-white text-slate-950 hover:bg-slate-100">
+              <Link href="/dashboard">Back to dashboard</Link>
+            </Button>
+            <Button
+              asChild
+              variant="outline"
+              className="border-white/15 bg-white/5 text-white hover:bg-white/10"
             >
-              Reset filters
-            </Link>
-          </Button>
-        </CardContent>
-      </Card>
+              <Link
+                href={buildNotificationsHref({
+                  type: "",
+                  status: "",
+                  notificationId: "",
+                })}
+              >
+                Reset filters
+              </Link>
+            </Button>
+          </>
+        }
+      />
     </div>
   );
 }
@@ -700,7 +654,9 @@ export default async function NotificationsPage({
                           <td className="px-4 py-4 text-sm text-slate-300">
                             <StatusBadge
                               label={formatEnumLabel(row.status)}
-                              className={getStatusTone(row.status)}
+                              className={getNotificationStatusBadgeClassName(
+                                row.status,
+                              )}
                             />
                           </td>
                           <td className="px-4 py-4 text-sm text-slate-300">
@@ -786,7 +742,9 @@ export default async function NotificationsPage({
                       value={
                         <StatusBadge
                           label={formatEnumLabel(state.selectedNotification.status)}
-                          className={getStatusTone(state.selectedNotification.status)}
+                          className={getNotificationStatusBadgeClassName(
+                            state.selectedNotification.status,
+                          )}
                         />
                       }
                     />
