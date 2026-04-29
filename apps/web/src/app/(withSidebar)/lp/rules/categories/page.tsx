@@ -4,10 +4,15 @@ import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import {
   prisma,
+  recordAuditLog,
   type LpMembershipRole,
-  type Prisma,
+  Prisma,
 } from "@vendorstream/database";
 import { authOptions } from "@/app/api/auth/[...nextauth]/options";
+import {
+  canManageLpRules,
+  MANAGEABLE_LP_RULE_ROLES,
+} from "@/lib/lp-rule-management-auth";
 import {
   Card,
   CardContent,
@@ -16,6 +21,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { CategoryRuleSelector } from "@/components/lp-rules/category-rule-selector";
 
 type CategoryRuleFilters = {
   lpId: string;
@@ -57,6 +63,7 @@ type CategoryRuleRow = {
 
 type SelectedCategoryRule = CategoryRuleRow & {
   productRules: ProductRuleRow[];
+  maxCommissionPercentInput: string;
 };
 
 type LpCategoryRulesState =
@@ -102,7 +109,7 @@ type LpCategoryRulesState =
       message: string;
     };
 
-const MANAGEABLE_LP_ROLES: LpMembershipRole[] = ["LP_ADMIN", "LP_MANAGER"];
+const MANAGEABLE_LP_ROLES = MANAGEABLE_LP_RULE_ROLES;
 
 function formatDate(value: Date | null) {
   if (!value) {
@@ -166,6 +173,30 @@ function getActiveTone(isActive: boolean) {
   }
 
   return "border-red-400/30 bg-red-500/10 text-red-100";
+}
+
+function getEffectiveStatus(
+  productIsActive: boolean,
+  categoryIsActive: boolean,
+) {
+  if (!productIsActive) {
+    return {
+      label: "Inactive",
+      tone: "border-red-400/30 bg-red-500/10 text-red-100",
+    };
+  }
+
+  if (!categoryIsActive) {
+    return {
+      label: "Blocked by inactive category",
+      tone: "border-amber-400/30 bg-amber-500/10 text-amber-100",
+    };
+  }
+
+  return {
+    label: "Effective",
+    tone: "border-emerald-400/30 bg-emerald-500/10 text-emerald-100",
+  };
 }
 
 function getRoleTone(role: LpMembershipRole) {
@@ -248,10 +279,34 @@ function getMutationBanner(mutation: string) {
     };
   }
 
+  if (mutation === "deleted") {
+    return {
+      tone: "success" as const,
+      message: "Category rule deleted successfully.",
+    };
+  }
+
   if (mutation === "invalid") {
     return {
       tone: "warning" as const,
-      message: "The submitted category rule action was invalid.",
+      message:
+        "Check the category key, max scale, commission percent, and active state.",
+    };
+  }
+
+  if (mutation === "duplicate") {
+    return {
+      tone: "warning" as const,
+      message:
+        "A category rule with that category key already exists for this LP.",
+    };
+  }
+
+  if (mutation === "conflict") {
+    return {
+      tone: "warning" as const,
+      message:
+        "The category rule conflicts with the current rule configuration.",
     };
   }
 
@@ -265,35 +320,116 @@ function getMutationBanner(mutation: string) {
   if (mutation === "forbidden") {
     return {
       tone: "warning" as const,
-      message: "You are not authorized to manage category rules in this LP context.",
+      message:
+        "You are not authorized to manage category rules in this LP context.",
     };
   }
 
   if (mutation === "error") {
     return {
       tone: "warning" as const,
-      message: "The category rule action could not be completed. Try again shortly.",
+      message:
+        "The category rule action could not be completed. Try again shortly.",
     };
   }
 
   return null;
 }
 
-function parseDecimalInput(value: string, fieldName: string) {
-  const trimmed = value.trim();
+type CategoryRuleFormValues = {
+  lpId: string;
+  ruleId: string;
+  categoryKey: string;
+  displayName: string | null;
+  maxScale: string;
+  maxCommissionPercent: string;
+  isActive: boolean;
+};
+
+function normalizeNumberInput(value: string) {
+  return value.replace(/[%\s,]/g, "").trim();
+}
+
+function parsePositiveDecimalInput(value: string) {
+  const trimmed = normalizeNumberInput(value);
   const parsed = Number(trimmed);
 
   if (!trimmed || !Number.isFinite(parsed) || parsed <= 0) {
-    return {
-      ok: false as const,
-      error: `${fieldName} must be greater than 0.`,
-    };
+    return null;
+  }
+
+  return parsed.toFixed(4);
+}
+
+function parseCommissionPercentInput(value: string) {
+  const trimmed = normalizeNumberInput(value);
+  const parsed = Number(trimmed);
+
+  if (!trimmed || !Number.isFinite(parsed) || parsed < 0 || parsed > 100) {
+    return null;
+  }
+
+  return parsed.toFixed(4);
+}
+
+function parseCategoryRuleForm(formData: FormData) {
+  const lpId = String(formData.get("lpId") || "").trim();
+  const ruleId = String(formData.get("ruleId") || "").trim();
+  const categoryKey = String(formData.get("categoryKey") || "").trim();
+  const displayName = String(formData.get("displayName") || "").trim();
+  const maxScale = parsePositiveDecimalInput(
+    String(formData.get("maxScale") || ""),
+  );
+  const maxCommissionPercent = parseCommissionPercentInput(
+    String(formData.get("maxCommissionPercent") || ""),
+  );
+
+  if (!lpId || !categoryKey || !maxScale || !maxCommissionPercent) {
+    console.warn("category_rule.save.invalid", {
+      keys: Array.from(formData.keys()),
+      hasLpId: Boolean(lpId),
+      hasRuleId: Boolean(ruleId),
+      hasCategoryKey: Boolean(categoryKey),
+      hasMaxScale: Boolean(maxScale),
+      hasMaxCommissionPercent: Boolean(maxCommissionPercent),
+      isActive: formData.get("isActive") === "on",
+    });
+    return null;
   }
 
   return {
-    ok: true as const,
-    value: parsed.toFixed(4),
-  };
+    lpId,
+    ruleId,
+    categoryKey,
+    displayName: displayName || null,
+    maxScale,
+    maxCommissionPercent,
+    isActive: formData.get("isActive") === "on",
+  } satisfies CategoryRuleFormValues;
+}
+
+function isUniqueConstraintError(error: unknown) {
+  return (
+    error instanceof Prisma.PrismaClientKnownRequestError &&
+    error.code === "P2002"
+  );
+}
+
+function addChangedField(
+  changedFields: Record<
+    string,
+    { previous: string | boolean | null; next: string | boolean | null }
+  >,
+  fieldName: string,
+  previous: string | boolean | null,
+  next: string | boolean | null,
+) {
+  if (previous !== next) {
+    changedFields[fieldName] = {
+      previous,
+      next,
+    };
+  }
 }
 
 async function saveCategoryRule(formData: FormData) {
@@ -305,31 +441,16 @@ async function saveCategoryRule(formData: FormData) {
     redirect("/login");
   }
 
+  const parsed = parseCategoryRuleForm(formData);
   const lpId = String(formData.get("lpId") || "").trim();
   const ruleId = String(formData.get("ruleId") || "").trim();
-  const categoryKey = String(formData.get("categoryKey") || "").trim();
-  const displayName = String(formData.get("displayName") || "").trim();
-  const maxScaleResult = parseDecimalInput(
-    String(formData.get("maxScale") || ""),
-    "Max scale",
-  );
-  const maxCommissionPercentResult = parseDecimalInput(
-    String(formData.get("maxCommissionPercent") || ""),
-    "Max commission percent",
-  );
-  const isActive = formData.get("isActive") === "on";
 
   const filters = {
     lpId,
     ruleId,
   };
 
-  if (
-    !lpId ||
-    !categoryKey ||
-    !maxScaleResult.ok ||
-    !maxCommissionPercentResult.ok
-  ) {
+  if (!parsed) {
     redirect(
       buildCategoryRulesHref({
         ...filters,
@@ -338,7 +459,9 @@ async function saveCategoryRule(formData: FormData) {
     );
   }
 
-  if (!session.user.id) {
+  const actorUserId = session.user.id;
+
+  if (!actorUserId) {
     redirect(
       buildCategoryRulesHref({
         ...filters,
@@ -347,21 +470,15 @@ async function saveCategoryRule(formData: FormData) {
     );
   }
 
-  const membership = await prisma.lpMembership.findFirst({
-    where: {
-      userId: session.user.id,
-      lpId,
-    },
-    select: {
-      role: true,
-    },
-  });
-
-  const canManageRules =
-    session.user.systemRole === "ADMIN" ||
-    (membership ? MANAGEABLE_LP_ROLES.includes(membership.role) : false);
-
-  if (!canManageRules) {
+  if (
+    !(await canManageLpRules({
+      actor: {
+        userId: actorUserId,
+        systemRole: session.user.systemRole,
+      },
+      lpId: parsed.lpId,
+    }))
+  ) {
     redirect(
       buildCategoryRulesHref({
         ...filters,
@@ -370,69 +487,184 @@ async function saveCategoryRule(formData: FormData) {
     );
   }
 
-  if (ruleId) {
-    const existingRule = await prisma.categoryRule.findFirst({
-      where: {
-        id: ruleId,
-        lpId,
-      },
-      select: {
-        id: true,
-      },
-    });
-
-    if (!existingRule) {
-      redirect(
-        buildCategoryRulesHref({
-          ...filters,
-          mutation: "not_found",
-        }),
-      );
-    }
-  }
+  let result:
+    | { status: "created" | "updated"; ruleId: string }
+    | { status: "duplicate" | "not_found"; ruleId: string };
 
   try {
-    if (ruleId) {
-      await prisma.categoryRule.update({
+    result = await prisma.$transaction(async (tx) => {
+      const duplicateRule = await tx.categoryRule.findFirst({
         where: {
-          id: ruleId,
+          lpId: parsed.lpId,
+          categoryKey: parsed.categoryKey,
+          ...(parsed.ruleId ? { NOT: { id: parsed.ruleId } } : {}),
         },
-        data: {
-          categoryKey,
-          displayName: displayName || null,
-          maxScale: maxScaleResult.value,
-          maxCommissionPercent: maxCommissionPercentResult.value,
-          isActive,
+        select: {
+          id: true,
         },
       });
-    }
 
-    const savedRule = ruleId
-      ? { id: ruleId }
-      : await prisma.categoryRule.create({
-          data: {
-            lpId,
-            categoryKey,
-            displayName: displayName || null,
-            maxScale: maxScaleResult.value,
-            maxCommissionPercent: maxCommissionPercentResult.value,
-            isActive,
+      if (duplicateRule) {
+        return {
+          status: "duplicate" as const,
+          ruleId: parsed.ruleId,
+        };
+      }
+
+      if (parsed.ruleId) {
+        const existingRule = await tx.categoryRule.findFirst({
+          where: {
+            id: parsed.ruleId,
+            lpId: parsed.lpId,
           },
           select: {
             id: true,
+            categoryKey: true,
+            displayName: true,
+            maxScale: true,
+            maxCommissionPercent: true,
+            isActive: true,
           },
         });
 
-    revalidatePath("/lp/rules/categories");
+        if (!existingRule) {
+          return {
+            status: "not_found" as const,
+            ruleId: parsed.ruleId,
+          };
+        }
 
-    redirect(
-      buildCategoryRulesHref({
-        lpId,
+        await tx.categoryRule.update({
+          where: {
+            id: parsed.ruleId,
+          },
+          data: {
+            categoryKey: parsed.categoryKey,
+            displayName: parsed.displayName,
+            maxScale: parsed.maxScale,
+            maxCommissionPercent: parsed.maxCommissionPercent,
+            isActive: parsed.isActive,
+          },
+        });
+
+        const changedFields: Record<
+          string,
+          { previous: string | boolean | null; next: string | boolean | null }
+        > = {};
+
+        addChangedField(
+          changedFields,
+          "categoryKey",
+          existingRule.categoryKey,
+          parsed.categoryKey,
+        );
+        addChangedField(
+          changedFields,
+          "displayName",
+          existingRule.displayName,
+          parsed.displayName,
+        );
+        addChangedField(
+          changedFields,
+          "maxScale",
+          existingRule.maxScale.toFixed(4),
+          parsed.maxScale,
+        );
+        addChangedField(
+          changedFields,
+          "maxCommissionPercent",
+          existingRule.maxCommissionPercent.toFixed(4),
+          parsed.maxCommissionPercent,
+        );
+        addChangedField(
+          changedFields,
+          "isActive",
+          existingRule.isActive,
+          parsed.isActive,
+        );
+
+        await recordAuditLog(tx, {
+          actorType: "USER",
+          actorUserId,
+          action: "category_rule.updated",
+          entityType: "CATEGORY_RULE",
+          entityId: parsed.ruleId,
+          metadata: {
+            lpId: parsed.lpId,
+            ruleId: parsed.ruleId,
+            categoryKey: parsed.categoryKey,
+            changedFields,
+          },
+        });
+
+        if (existingRule.isActive !== parsed.isActive) {
+          await recordAuditLog(tx, {
+            actorType: "USER",
+            actorUserId,
+            action: parsed.isActive
+              ? "category_rule.activated"
+              : "category_rule.deactivated",
+            entityType: "CATEGORY_RULE",
+            entityId: parsed.ruleId,
+            metadata: {
+              lpId: parsed.lpId,
+              ruleId: parsed.ruleId,
+              categoryKey: parsed.categoryKey,
+              previousActiveState: existingRule.isActive,
+              nextActiveState: parsed.isActive,
+            },
+          });
+        }
+
+        return {
+          status: "updated" as const,
+          ruleId: parsed.ruleId,
+        };
+      }
+
+      const savedRule = await tx.categoryRule.create({
+        data: {
+          lpId: parsed.lpId,
+          categoryKey: parsed.categoryKey,
+          displayName: parsed.displayName,
+          maxScale: parsed.maxScale,
+          maxCommissionPercent: parsed.maxCommissionPercent,
+          isActive: parsed.isActive,
+        },
+        select: {
+          id: true,
+        },
+      });
+
+      await recordAuditLog(tx, {
+        actorType: "USER",
+        actorUserId,
+        action: "category_rule.created",
+        entityType: "CATEGORY_RULE",
+        entityId: savedRule.id,
+        metadata: {
+          lpId: parsed.lpId,
+          ruleId: savedRule.id,
+          categoryKey: parsed.categoryKey,
+          isActive: parsed.isActive,
+        },
+      });
+
+      return {
+        status: "created" as const,
         ruleId: savedRule.id,
-        mutation: ruleId ? "updated" : "created",
-      }),
-    );
+      };
+    });
   } catch (error) {
+    if (isUniqueConstraintError(error)) {
+      redirect(
+        buildCategoryRulesHref({
+          ...filters,
+          mutation: "duplicate",
+        }),
+      );
+    }
+
     console.error("Failed to save category rule", error);
 
     redirect(
@@ -442,6 +674,24 @@ async function saveCategoryRule(formData: FormData) {
       }),
     );
   }
+
+  if (result.status === "duplicate" || result.status === "not_found") {
+    redirect(
+      buildCategoryRulesHref({
+        ...filters,
+        mutation: result.status,
+      }),
+    );
+  }
+
+  revalidatePath("/lp/rules/categories");
+  redirect(
+    buildCategoryRulesHref({
+      lpId: parsed.lpId,
+      ruleId: result.ruleId,
+      mutation: result.status,
+    }),
+  );
 }
 
 async function toggleCategoryRuleStatus(formData: FormData) {
@@ -471,7 +721,9 @@ async function toggleCategoryRuleStatus(formData: FormData) {
     );
   }
 
-  if (!session.user.id) {
+  const actorUserId = session.user.id;
+
+  if (!actorUserId) {
     redirect(
       buildCategoryRulesHref({
         ...filters,
@@ -480,21 +732,15 @@ async function toggleCategoryRuleStatus(formData: FormData) {
     );
   }
 
-  const membership = await prisma.lpMembership.findFirst({
-    where: {
-      userId: session.user.id,
+  if (
+    !(await canManageLpRules({
+      actor: {
+        userId: actorUserId,
+        systemRole: session.user.systemRole,
+      },
       lpId,
-    },
-    select: {
-      role: true,
-    },
-  });
-
-  const canManageRules =
-    session.user.systemRole === "ADMIN" ||
-    (membership ? MANAGEABLE_LP_ROLES.includes(membership.role) : false);
-
-  if (!canManageRules) {
+    }))
+  ) {
     redirect(
       buildCategoryRulesHref({
         ...filters,
@@ -502,42 +748,61 @@ async function toggleCategoryRuleStatus(formData: FormData) {
       }),
     );
   }
+
+  let result: { status: "activated" | "deactivated" | "not_found" };
 
   try {
-    const rule = await prisma.categoryRule.findFirst({
-      where: {
-        id: ruleId,
-        lpId,
-      },
-      select: {
-        id: true,
-      },
+    result = await prisma.$transaction(async (tx) => {
+      const rule = await tx.categoryRule.findFirst({
+        where: {
+          id: ruleId,
+          lpId,
+        },
+        select: {
+          id: true,
+          categoryKey: true,
+          isActive: true,
+        },
+      });
+
+      if (!rule) {
+        return {
+          status: "not_found" as const,
+        };
+      }
+
+      const nextIsActive = nextStatus === "ACTIVE";
+
+      await tx.categoryRule.update({
+        where: { id: ruleId },
+        data: {
+          isActive: nextIsActive,
+        },
+      });
+
+      await recordAuditLog(tx, {
+        actorType: "USER",
+        actorUserId,
+        action: nextIsActive
+          ? "category_rule.activated"
+          : "category_rule.deactivated",
+        entityType: "CATEGORY_RULE",
+        entityId: ruleId,
+        metadata: {
+          lpId,
+          ruleId,
+          categoryKey: rule.categoryKey,
+          previousActiveState: rule.isActive,
+          nextActiveState: nextIsActive,
+        },
+      });
+
+      return {
+        status: nextIsActive
+          ? ("activated" as const)
+          : ("deactivated" as const),
+      };
     });
-
-    if (!rule) {
-      redirect(
-        buildCategoryRulesHref({
-          ...filters,
-          mutation: "not_found",
-        }),
-      );
-    }
-
-    await prisma.categoryRule.update({
-      where: { id: ruleId },
-      data: {
-        isActive: nextStatus === "ACTIVE",
-      },
-    });
-
-    revalidatePath("/lp/rules/categories");
-
-    redirect(
-      buildCategoryRulesHref({
-        ...filters,
-        mutation: nextStatus === "ACTIVE" ? "activated" : "deactivated",
-      }),
-    );
   } catch (error) {
     console.error("Failed to update category rule status", error);
 
@@ -548,6 +813,147 @@ async function toggleCategoryRuleStatus(formData: FormData) {
       }),
     );
   }
+
+  if (result.status === "not_found") {
+    redirect(
+      buildCategoryRulesHref({
+        ...filters,
+        mutation: "not_found",
+      }),
+    );
+  }
+
+  revalidatePath("/lp/rules/categories");
+  redirect(
+    buildCategoryRulesHref({
+      ...filters,
+      mutation: result.status,
+    }),
+  );
+}
+
+async function deleteCategoryRule(formData: FormData) {
+  "use server";
+
+  const session = await getServerSession(authOptions);
+
+  if (!session?.user) {
+    redirect("/login");
+  }
+
+  const lpId = String(formData.get("lpId") || "").trim();
+  const ruleId = String(formData.get("ruleId") || "").trim();
+
+  if (!lpId || !ruleId) {
+    redirect(
+      buildCategoryRulesHref({
+        lpId,
+        ruleId,
+        mutation: "invalid",
+      }),
+    );
+  }
+
+  const actorUserId = session.user.id;
+
+  if (!actorUserId) {
+    redirect(
+      buildCategoryRulesHref({
+        lpId,
+        ruleId,
+        mutation: "forbidden",
+      }),
+    );
+  }
+
+  if (
+    !(await canManageLpRules({
+      actor: {
+        userId: actorUserId,
+        systemRole: session.user.systemRole,
+      },
+      lpId,
+    }))
+  ) {
+    redirect(
+      buildCategoryRulesHref({
+        lpId,
+        ruleId,
+        mutation: "forbidden",
+      }),
+    );
+  }
+
+  let result: { status: "deleted" | "not_found" };
+
+  try {
+    result = await prisma.$transaction(async (tx) => {
+      const rule = await tx.categoryRule.findFirst({
+        where: {
+          id: ruleId,
+          lpId,
+        },
+        select: {
+          id: true,
+          categoryKey: true,
+          isActive: true,
+        },
+      });
+
+      if (!rule) {
+        return { status: "not_found" as const };
+      }
+
+      await tx.categoryRule.delete({
+        where: { id: ruleId },
+      });
+
+      await recordAuditLog(tx, {
+        actorType: "USER",
+        actorUserId,
+        action: "category_rule.deleted",
+        entityType: "CATEGORY_RULE",
+        entityId: ruleId,
+        metadata: {
+          lpId,
+          ruleId,
+          categoryKey: rule.categoryKey,
+          previousActiveState: rule.isActive,
+        },
+      });
+
+      return { status: "deleted" as const };
+    });
+  } catch (error) {
+    console.error("Failed to delete category rule", error);
+
+    redirect(
+      buildCategoryRulesHref({
+        lpId,
+        ruleId,
+        mutation: "error",
+      }),
+    );
+  }
+
+  if (result.status === "not_found") {
+    redirect(
+      buildCategoryRulesHref({
+        lpId,
+        ruleId,
+        mutation: "not_found",
+      }),
+    );
+  }
+
+  revalidatePath("/lp/rules/categories");
+  redirect(
+    buildCategoryRulesHref({
+      lpId,
+      ruleId: "",
+      mutation: "deleted",
+    }),
+  );
 }
 
 async function getLpCategoryRulesState(
@@ -578,13 +984,15 @@ async function getLpCategoryRulesState(
       return { kind: "forbidden" };
     }
 
-    const availableContexts: LpContextOption[] = memberships.map((membership) => ({
-      membershipId: membership.id,
-      lpId: membership.lp.id,
-      lpName: membership.lp.name,
-      lpCode: membership.lp.code,
-      membershipRole: membership.role,
-    }));
+    const availableContexts: LpContextOption[] = memberships.map(
+      (membership) => ({
+        membershipId: membership.id,
+        lpId: membership.lp.id,
+        lpName: membership.lp.name,
+        lpCode: membership.lp.code,
+        membershipRole: membership.role,
+      }),
+    );
 
     const currentMembership =
       availableContexts.find((context) => context.lpId === filters.lpId) ??
@@ -594,51 +1002,56 @@ async function getLpCategoryRulesState(
       systemRole === "ADMIN" ||
       MANAGEABLE_LP_ROLES.includes(currentMembership.membershipRole);
 
-    const [categoryRuleCount, activeCategoryRuleCount, productScaleRuleCount, storeCoverageCount, rows] =
-      await Promise.all([
-        prisma.categoryRule.count({
-          where: { lpId: currentMembership.lpId },
-        }),
-        prisma.categoryRule.count({
-          where: {
-            lpId: currentMembership.lpId,
-            isActive: true,
-          },
-        }),
-        prisma.productScaleRule.count({
-          where: { lpId: currentMembership.lpId },
-        }),
-        prisma.storeLocationLpAssignment.count({
-          where: {
-            lpId: currentMembership.lpId,
-            isActive: true,
-          },
-        }),
-        prisma.categoryRule.findMany({
-          where: {
-            lpId: currentMembership.lpId,
-          },
-          orderBy: [{ categoryKey: "asc" }],
-          take: 50,
-          select: {
-            id: true,
-            categoryKey: true,
-            displayName: true,
-            maxScale: true,
-            maxCommissionPercent: true,
-            isActive: true,
-            effectiveFrom: true,
-            effectiveTo: true,
-            createdAt: true,
-            updatedAt: true,
-            _count: {
-              select: {
-                productScaleRules: true,
-              },
+    const [
+      categoryRuleCount,
+      activeCategoryRuleCount,
+      productScaleRuleCount,
+      storeCoverageCount,
+      rows,
+    ] = await Promise.all([
+      prisma.categoryRule.count({
+        where: { lpId: currentMembership.lpId },
+      }),
+      prisma.categoryRule.count({
+        where: {
+          lpId: currentMembership.lpId,
+          isActive: true,
+        },
+      }),
+      prisma.productScaleRule.count({
+        where: { lpId: currentMembership.lpId },
+      }),
+      prisma.storeLocationLpAssignment.count({
+        where: {
+          lpId: currentMembership.lpId,
+          isActive: true,
+        },
+      }),
+      prisma.categoryRule.findMany({
+        where: {
+          lpId: currentMembership.lpId,
+        },
+        orderBy: [{ categoryKey: "asc" }],
+        take: 50,
+        select: {
+          id: true,
+          categoryKey: true,
+          displayName: true,
+          maxScale: true,
+          maxCommissionPercent: true,
+          isActive: true,
+          effectiveFrom: true,
+          effectiveTo: true,
+          createdAt: true,
+          updatedAt: true,
+          _count: {
+            select: {
+              productScaleRules: true,
             },
           },
-        }),
-      ]);
+        },
+      }),
+    ]);
 
     const currentContext = {
       lpId: currentMembership.lpId,
@@ -680,7 +1093,9 @@ async function getLpCategoryRulesState(
     }));
 
     const selectedRuleId =
-      mappedRows.find((row) => row.id === filters.ruleId)?.id ?? mappedRows[0]?.id ?? "";
+      mappedRows.find((row) => row.id === filters.ruleId)?.id ??
+      mappedRows[0]?.id ??
+      "";
 
     const selectedRuleSource = await prisma.categoryRule.findFirst({
       where: {
@@ -728,6 +1143,9 @@ async function getLpCategoryRulesState(
           maxCommissionPercent: formatDecimal(
             selectedRuleSource.maxCommissionPercent,
             "%",
+          ),
+          maxCommissionPercentInput: formatDecimal(
+            selectedRuleSource.maxCommissionPercent,
           ),
           isActive: selectedRuleSource.isActive,
           effectiveFrom: selectedRuleSource.effectiveFrom,
@@ -856,6 +1274,7 @@ export default async function LpCategoryRulesPage({
     session.user.systemRole,
   );
   const mutationBanner = getMutationBanner(filters.mutation);
+  const selectedRule = state.kind === "ready" ? state.selectedRule : null;
 
   return (
     <main className="relative min-h-screen overflow-hidden text-white">
@@ -911,10 +1330,7 @@ export default async function LpCategoryRulesPage({
               </CardHeader>
               <CardContent className="space-y-4">
                 <div className="grid gap-3 lg:grid-cols-2">
-                  <DetailRow
-                    label="LP"
-                    value={state.currentContext.lpName}
-                  />
+                  <DetailRow label="LP" value={state.currentContext.lpName} />
                   <DetailRow
                     label="LP code"
                     value={state.currentContext.lpCode ?? "No code"}
@@ -923,8 +1339,12 @@ export default async function LpCategoryRulesPage({
                     label="Membership role"
                     value={
                       <StatusBadge
-                        label={formatEnumLabel(state.currentContext.membershipRole)}
-                        className={getRoleTone(state.currentContext.membershipRole)}
+                        label={formatEnumLabel(
+                          state.currentContext.membershipRole,
+                        )}
+                        className={getRoleTone(
+                          state.currentContext.membershipRole,
+                        )}
                       />
                     }
                   />
@@ -946,7 +1366,9 @@ export default async function LpCategoryRulesPage({
                   />
                   <DetailRow
                     label="Rule permissions"
-                    value={state.canManageRules ? "Manage enabled" : "View only"}
+                    value={
+                      state.canManageRules ? "Manage enabled" : "View only"
+                    }
                   />
                 </div>
 
@@ -997,29 +1419,34 @@ export default async function LpCategoryRulesPage({
                     </CardDescription>
                   </div>
                   <form
+                    id="category-rule-create-form"
                     action={saveCategoryRule}
                     className="grid min-w-72 gap-3 rounded-2xl border border-cyan-400/20 bg-cyan-400/10 px-4 py-3 text-sm leading-6 text-cyan-100"
                   >
                     <input
                       type="hidden"
                       name="lpId"
+                      form="category-rule-create-form"
                       value={state.currentContext.lpId}
                     />
                     <div className="font-medium text-white">Create rule</div>
                     <input
                       name="categoryKey"
+                      form="category-rule-create-form"
                       required
                       placeholder="Category key"
                       className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
                     />
                     <input
                       name="displayName"
+                      form="category-rule-create-form"
                       placeholder="Display name"
                       className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
                     />
                     <div className="grid gap-3 sm:grid-cols-2">
                       <input
                         name="maxScale"
+                        form="category-rule-create-form"
                         required
                         inputMode="decimal"
                         placeholder="Max scale"
@@ -1027,6 +1454,7 @@ export default async function LpCategoryRulesPage({
                       />
                       <input
                         name="maxCommissionPercent"
+                        form="category-rule-create-form"
                         required
                         inputMode="decimal"
                         placeholder="Max commission %"
@@ -1037,6 +1465,7 @@ export default async function LpCategoryRulesPage({
                       <input
                         type="checkbox"
                         name="isActive"
+                        form="category-rule-create-form"
                         defaultChecked
                         className="size-4 accent-cyan-300"
                       />
@@ -1044,6 +1473,7 @@ export default async function LpCategoryRulesPage({
                     </label>
                     <Button
                       type="submit"
+                      form="category-rule-create-form"
                       size="sm"
                       disabled={!state.canManageRules}
                       className="bg-white text-slate-950 hover:bg-slate-100 disabled:bg-white/20 disabled:text-slate-400"
@@ -1064,15 +1494,25 @@ export default async function LpCategoryRulesPage({
                     <table className="min-w-full border-collapse text-left">
                       <thead className="border-b border-white/8 bg-white/5">
                         <tr className="text-xs uppercase tracking-[0.16em] text-slate-400">
-                          <th className="px-4 py-3 font-medium">Category key</th>
-                          <th className="px-4 py-3 font-medium">Display name</th>
+                          <th className="px-4 py-3 font-medium">
+                            Category key
+                          </th>
+                          <th className="px-4 py-3 font-medium">
+                            Display name
+                          </th>
                           <th className="px-4 py-3 font-medium">Max scale</th>
                           <th className="px-4 py-3 font-medium">
                             Max commission percent
                           </th>
-                          <th className="px-4 py-3 font-medium">Active status</th>
-                          <th className="px-4 py-3 font-medium">Effective from</th>
-                          <th className="px-4 py-3 font-medium">Effective to</th>
+                          <th className="px-4 py-3 font-medium">
+                            Active status
+                          </th>
+                          <th className="px-4 py-3 font-medium">
+                            Effective from
+                          </th>
+                          <th className="px-4 py-3 font-medium">
+                            Effective to
+                          </th>
                           <th className="px-4 py-3 font-medium">Actions</th>
                         </tr>
                       </thead>
@@ -1081,7 +1521,9 @@ export default async function LpCategoryRulesPage({
                           <tr
                             key={row.id}
                             className={`border-b border-white/8 last:border-b-0 ${
-                              row.id === state.selectedRule?.id ? "bg-cyan-400/8" : ""
+                              row.id === state.selectedRule?.id
+                                ? "bg-cyan-400/8"
+                                : ""
                             }`}
                           >
                             <td className="px-4 py-4 text-sm font-medium text-white">
@@ -1110,36 +1552,53 @@ export default async function LpCategoryRulesPage({
                             </td>
                             <td className="px-4 py-4 text-sm">
                               <div className="flex flex-wrap gap-2">
-                                <Button
-                                  asChild
-                                  size="sm"
-                                  variant="ghost"
-                                  className="text-slate-300 hover:bg-white/5 hover:text-white"
+                                <form
+                                  id={`category-rule-delete-form-${row.id}`}
+                                  action={deleteCategoryRule}
                                 >
-                                  <Link
-                                    href={buildCategoryRulesHref({
-                                      lpId: state.currentContext.lpId,
-                                      ruleId: row.id,
-                                      mutation: undefined,
-                                    })}
-                                  >
-                                    Edit rule
-                                  </Link>
-                                </Button>
-
-                                <form action={toggleCategoryRuleStatus}>
                                   <input
                                     type="hidden"
                                     name="lpId"
+                                    form={`category-rule-delete-form-${row.id}`}
                                     value={state.currentContext.lpId}
                                   />
                                   <input
                                     type="hidden"
                                     name="ruleId"
+                                    form={`category-rule-delete-form-${row.id}`}
                                     value={row.id}
                                   />
                                   <Button
                                     type="submit"
+                                    form={`category-rule-delete-form-${row.id}`}
+                                    size="sm"
+                                    variant="outline"
+                                    disabled={!state.canManageRules}
+                                    className="border-red-400/20 bg-red-500/10 text-red-100 hover:bg-red-500/20 disabled:text-slate-500"
+                                  >
+                                    Delete rule
+                                  </Button>
+                                </form>
+
+                                <form
+                                  id={`category-rule-toggle-row-form-${row.id}`}
+                                  action={toggleCategoryRuleStatus}
+                                >
+                                  <input
+                                    type="hidden"
+                                    name="lpId"
+                                    form={`category-rule-toggle-row-form-${row.id}`}
+                                    value={state.currentContext.lpId}
+                                  />
+                                  <input
+                                    type="hidden"
+                                    name="ruleId"
+                                    form={`category-rule-toggle-row-form-${row.id}`}
+                                    value={row.id}
+                                  />
+                                  <Button
+                                    type="submit"
+                                    form={`category-rule-toggle-row-form-${row.id}`}
                                     size="sm"
                                     name="nextStatus"
                                     value={row.isActive ? "INACTIVE" : "ACTIVE"}
@@ -1162,13 +1621,9 @@ export default async function LpCategoryRulesPage({
                                   className="border-white/15 bg-white/5 text-white hover:bg-white/10"
                                 >
                                   <Link
-                                    href={buildCategoryRulesHref({
-                                      lpId: state.currentContext.lpId,
-                                      ruleId: row.id,
-                                      mutation: undefined,
-                                    })}
+                                    href={`/lp/rules/products?lpId=${state.currentContext.lpId}&category=${row.id}`}
                                   >
-                                    View related product rules
+                                    View product rules
                                   </Link>
                                 </Button>
                               </div>
@@ -1182,206 +1637,288 @@ export default async function LpCategoryRulesPage({
               </CardContent>
             </Card>
 
-            {state.kind === "ready" && state.selectedRule ? (
-              <div className="grid gap-4 xl:grid-cols-[1fr_0.95fr]">
+            {state.kind === "ready" && selectedRule ? (
+              <div className="space-y-4">
                 <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
                   <CardHeader className="space-y-2">
-                    <CardTitle className="text-xl text-white">
-                      Category rule details
+                    <CardTitle className="text-lg text-white">
+                      Selected category rule
                     </CardTitle>
                     <CardDescription className="text-sm leading-6 text-slate-300">
-                      Review the selected category rule and linked product-scale
-                      coverage.
+                      Choose a category rule to view details, related product
+                      rules, and edit actions.
                     </CardDescription>
                   </CardHeader>
-                  <CardContent className="grid gap-3">
-                    <DetailRow label="Rule ID" value={state.selectedRule.id} />
-                    <DetailRow
-                      label="Category key"
-                      value={state.selectedRule.categoryKey}
-                    />
-                    <DetailRow
-                      label="Display name"
-                      value={state.selectedRule.displayName ?? "Not set"}
-                    />
-                    <DetailRow
-                      label="Max scale"
-                      value={state.selectedRule.maxScale}
-                    />
-                    <DetailRow
-                      label="Max commission percent"
-                      value={state.selectedRule.maxCommissionPercent}
-                    />
-                    <DetailRow
-                      label="Status"
-                      value={
-                        <StatusBadge
-                          label={state.selectedRule.isActive ? "Active" : "Inactive"}
-                          className={getActiveTone(state.selectedRule.isActive)}
-                        />
-                      }
-                    />
-                    <DetailRow
-                      label="Effective from"
-                      value={formatDate(state.selectedRule.effectiveFrom)}
-                    />
-                    <DetailRow
-                      label="Effective to"
-                      value={formatDate(state.selectedRule.effectiveTo)}
-                    />
-                    <DetailRow
-                      label="Related product rules"
-                      value={String(state.selectedRule.productScaleRuleCount)}
-                    />
-                    <DetailRow
-                      label="Created at"
-                      value={formatDateTime(state.selectedRule.createdAt)}
-                    />
-                    <DetailRow
-                      label="Updated at"
-                      value={formatDateTime(state.selectedRule.updatedAt)}
+                  <CardContent>
+                    <CategoryRuleSelector
+                      lpId={state.currentContext.lpId}
+                      selectedRuleId={state.selectedRule?.id ?? ""}
+                      rules={state.rows.map((row) => ({
+                        id: row.id,
+                        label: row.displayName ?? row.categoryKey,
+                        isActive: row.isActive,
+                      }))}
                     />
                   </CardContent>
                 </Card>
 
-                <div className="grid gap-4">
+                <div className="grid gap-4 xl:grid-cols-[1fr_0.95fr]">
                   <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
                     <CardHeader className="space-y-2">
                       <CardTitle className="text-xl text-white">
-                        Related product rules
+                        Category rule details
                       </CardTitle>
                       <CardDescription className="text-sm leading-6 text-slate-300">
-                        Product-scale rules currently linked to this category rule.
+                        Review the selected category rule and linked
+                        product-scale coverage.
                       </CardDescription>
                     </CardHeader>
-                    <CardContent className="space-y-3">
-                      {state.selectedRule.productRules.length > 0 ? (
-                        state.selectedRule.productRules.map((rule) => (
-                          <div
-                            key={rule.id}
-                            className="rounded-2xl border border-white/8 bg-slate-950/35 px-4 py-4"
-                          >
-                            <div className="flex flex-wrap items-start justify-between gap-3">
-                              <div className="space-y-1">
-                                <div className="text-sm font-medium text-white">
-                                  {rule.productNameSnapshot || rule.barcode}
-                                </div>
-                                <div className="text-xs text-slate-500">
-                                  {rule.barcode} · scale {rule.productScale}
-                                </div>
-                                <div className="text-xs text-slate-500">
-                                  {formatDate(rule.effectiveFrom)} to{" "}
-                                  {formatDate(rule.effectiveTo)}
+                    <CardContent className="grid gap-3">
+                      <DetailRow label="Rule ID" value={selectedRule.id} />
+                      <DetailRow
+                        label="Category key"
+                        value={selectedRule.categoryKey}
+                      />
+                      <DetailRow
+                        label="Display name"
+                        value={selectedRule.displayName ?? "Not set"}
+                      />
+                      <DetailRow
+                        label="Max scale"
+                        value={selectedRule.maxScale}
+                      />
+                      <DetailRow
+                        label="Max commission percent"
+                        value={selectedRule.maxCommissionPercent}
+                      />
+                      <DetailRow
+                        label="Status"
+                        value={
+                          <StatusBadge
+                            label={
+                              selectedRule.isActive ? "Active" : "Inactive"
+                            }
+                            className={getActiveTone(selectedRule.isActive)}
+                          />
+                        }
+                      />
+                      <DetailRow
+                        label="Effective from"
+                        value={formatDate(selectedRule.effectiveFrom)}
+                      />
+                      <DetailRow
+                        label="Effective to"
+                        value={formatDate(selectedRule.effectiveTo)}
+                      />
+                      <DetailRow
+                        label="Related product rules"
+                        value={String(selectedRule.productScaleRuleCount)}
+                      />
+                      <DetailRow
+                        label="Created at"
+                        value={formatDateTime(selectedRule.createdAt)}
+                      />
+                      <DetailRow
+                        label="Updated at"
+                        value={formatDateTime(selectedRule.updatedAt)}
+                      />
+                    </CardContent>
+                  </Card>
+
+                  <div className="grid gap-4">
+                    <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
+                      <CardHeader className="space-y-2">
+                        <CardTitle className="text-xl text-white">
+                          Related product rules
+                        </CardTitle>
+                        <CardDescription className="text-sm leading-6 text-slate-300">
+                          Product-scale rules currently linked to this category
+                          rule.
+                        </CardDescription>
+                      </CardHeader>
+                      <CardContent className="space-y-3">
+                        {!selectedRule.isActive ? (
+                          <div className="rounded-xl border border-amber-400/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-100">
+                            This category is inactive. Linked product rules are
+                            preserved but unavailable for reconciliation until
+                            the category is reactivated.
+                          </div>
+                        ) : null}
+                        {selectedRule.productRules.length > 0 ? (
+                          selectedRule.productRules.map((rule) => {
+                            const effectiveStatus = getEffectiveStatus(
+                              rule.isActive,
+                              selectedRule.isActive,
+                            );
+
+                            return (
+                              <div
+                                key={rule.id}
+                                className="rounded-2xl border border-white/8 bg-slate-950/35 px-4 py-4"
+                              >
+                                <div className="flex flex-wrap items-start justify-between gap-3">
+                                  <div className="space-y-1">
+                                    <div className="text-sm font-medium text-white">
+                                      {rule.productNameSnapshot || rule.barcode}
+                                    </div>
+                                    <div className="text-xs text-slate-500">
+                                      {rule.barcode} · scale {rule.productScale}
+                                    </div>
+                                    <div className="text-xs text-slate-500">
+                                      {formatDate(rule.effectiveFrom)} to{" "}
+                                      {formatDate(rule.effectiveTo)}
+                                    </div>
+                                  </div>
+                                  <div className="flex flex-col items-end gap-2">
+                                    <StatusBadge
+                                      label={
+                                        rule.isActive ? "Active" : "Inactive"
+                                      }
+                                      className={getActiveTone(rule.isActive)}
+                                    />
+                                    <StatusBadge
+                                      label={effectiveStatus.label}
+                                      className={effectiveStatus.tone}
+                                    />
+                                  </div>
                                 </div>
                               </div>
-                              <StatusBadge
-                                label={rule.isActive ? "Active" : "Inactive"}
-                                className={getActiveTone(rule.isActive)}
-                              />
-                            </div>
+                            );
+                          })
+                        ) : (
+                          <EmptyListState label="related product rules" />
+                        )}
+                      </CardContent>
+                    </Card>
+
+                    <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
+                      <CardHeader className="space-y-2">
+                        <CardTitle className="text-xl text-white">
+                          Rule actions
+                        </CardTitle>
+                        <CardDescription className="text-sm leading-6 text-slate-300">
+                          Update the selected category rule for this LP
+                          workspace.
+                        </CardDescription>
+                      </CardHeader>
+                      <CardContent className="space-y-4">
+                        <form
+                          id="category-rule-edit-form"
+                          action={saveCategoryRule}
+                          className="grid gap-3"
+                        >
+                          <input
+                            type="hidden"
+                            name="lpId"
+                            form="category-rule-edit-form"
+                            value={state.currentContext.lpId}
+                          />
+                          <input
+                            type="hidden"
+                            name="ruleId"
+                            form="category-rule-edit-form"
+                            value={selectedRule.id}
+                          />
+                          <input
+                            name="categoryKey"
+                            form="category-rule-edit-form"
+                            required
+                            defaultValue={selectedRule.categoryKey}
+                            className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
+                          />
+                          <input
+                            name="displayName"
+                            form="category-rule-edit-form"
+                            defaultValue={selectedRule.displayName ?? ""}
+                            className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
+                          />
+                          <div className="grid gap-3 sm:grid-cols-2">
+                            <input
+                              name="maxScale"
+                              form="category-rule-edit-form"
+                              required
+                              inputMode="decimal"
+                              defaultValue={selectedRule.maxScale}
+                              className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
+                            />
+                            <input
+                              name="maxCommissionPercent"
+                              form="category-rule-edit-form"
+                              required
+                              inputMode="decimal"
+                              defaultValue={
+                                selectedRule.maxCommissionPercentInput
+                              }
+                              className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
+                            />
                           </div>
-                        ))
-                      ) : (
-                        <EmptyListState label="related product rules" />
-                      )}
-                    </CardContent>
-                  </Card>
+                          <label className="flex items-center gap-2 text-xs text-slate-300">
+                            <input
+                              type="checkbox"
+                              name="isActive"
+                              form="category-rule-edit-form"
+                              defaultChecked={selectedRule.isActive}
+                              className="size-4 accent-cyan-300"
+                            />
+                            Active
+                          </label>
+                          <Button
+                            type="submit"
+                            form="category-rule-edit-form"
+                            disabled={!state.canManageRules}
+                            className="w-full bg-cyan-400 text-slate-950 hover:bg-cyan-300 disabled:bg-white/20 disabled:text-slate-400"
+                          >
+                            Save category rule
+                          </Button>
+                        </form>
 
-                  <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
-                    <CardHeader className="space-y-2">
-                      <CardTitle className="text-xl text-white">
-                        Rule actions
-                      </CardTitle>
-                      <CardDescription className="text-sm leading-6 text-slate-300">
-                        Update the selected category rule for this LP workspace.
-                      </CardDescription>
-                    </CardHeader>
-                    <CardContent className="space-y-4">
-                      <form action={saveCategoryRule} className="grid gap-3">
-                        <input
-                          type="hidden"
-                          name="lpId"
-                          value={state.currentContext.lpId}
-                        />
-                        <input
-                          type="hidden"
-                          name="ruleId"
-                          value={state.selectedRule.id}
-                        />
-                        <input
-                          name="categoryKey"
-                          required
-                          defaultValue={state.selectedRule.categoryKey}
-                          className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
-                        />
-                        <input
-                          name="displayName"
-                          defaultValue={state.selectedRule.displayName ?? ""}
-                          className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
-                        />
-                        <div className="grid gap-3 sm:grid-cols-2">
-                          <input
-                            name="maxScale"
-                            required
-                            inputMode="decimal"
-                            defaultValue={state.selectedRule.maxScale}
-                            className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
-                          />
-                          <input
-                            name="maxCommissionPercent"
-                            required
-                            inputMode="decimal"
-                            defaultValue={state.selectedRule.maxCommissionPercent}
-                            className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
-                          />
-                        </div>
-                        <label className="flex items-center gap-2 text-xs text-slate-300">
-                          <input
-                            type="checkbox"
-                            name="isActive"
-                            defaultChecked={state.selectedRule.isActive}
-                            className="size-4 accent-cyan-300"
-                          />
-                          Active
-                        </label>
-                        <Button
-                          type="submit"
-                          disabled={!state.canManageRules}
-                          className="w-full bg-cyan-400 text-slate-950 hover:bg-cyan-300 disabled:bg-white/20 disabled:text-slate-400"
-                        >
-                          Save category rule
-                        </Button>
-                      </form>
+                        {selectedRule.productScaleRuleCount > 0 ? (
+                          <div className="rounded-xl border border-amber-400/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-100">
+                            Deactivating this category will make{" "}
+                            {selectedRule.productScaleRuleCount} linked product
+                            rule(s) unavailable for reconciliation. Their own
+                            active/inactive states will be preserved.
+                          </div>
+                        ) : null}
 
-                      <form action={toggleCategoryRuleStatus}>
-                        <input
-                          type="hidden"
-                          name="lpId"
-                          value={state.currentContext.lpId}
-                        />
-                        <input
-                          type="hidden"
-                          name="ruleId"
-                          value={state.selectedRule.id}
-                        />
-                        <Button
-                          type="submit"
-                          name="nextStatus"
-                          value={state.selectedRule.isActive ? "INACTIVE" : "ACTIVE"}
-                          disabled={!state.canManageRules}
-                          className={
-                            state.selectedRule.isActive
-                              ? "w-full bg-red-500 text-white hover:bg-red-400 disabled:bg-white/20 disabled:text-slate-400"
-                              : "w-full bg-emerald-500 text-white hover:bg-emerald-400 disabled:bg-white/20 disabled:text-slate-400"
-                          }
+                        <form
+                          id="category-rule-toggle-form"
+                          action={toggleCategoryRuleStatus}
                         >
-                          {state.selectedRule.isActive
-                            ? "Deactivate category rule"
-                            : "Activate category rule"}
-                        </Button>
-                      </form>
-                    </CardContent>
-                  </Card>
+                          <input
+                            type="hidden"
+                            name="lpId"
+                            form="category-rule-toggle-form"
+                            value={state.currentContext.lpId}
+                          />
+                          <input
+                            type="hidden"
+                            name="ruleId"
+                            form="category-rule-toggle-form"
+                            value={selectedRule.id}
+                          />
+                          <Button
+                            type="submit"
+                            form="category-rule-toggle-form"
+                            name="nextStatus"
+                            value={
+                              selectedRule.isActive ? "INACTIVE" : "ACTIVE"
+                            }
+                            disabled={!state.canManageRules}
+                            className={
+                              selectedRule.isActive
+                                ? "w-full bg-red-500 text-white hover:bg-red-400 disabled:bg-white/20 disabled:text-slate-400"
+                                : "w-full bg-emerald-500 text-white hover:bg-emerald-400 disabled:bg-white/20 disabled:text-slate-400"
+                            }
+                          >
+                            {selectedRule.isActive
+                              ? "Deactivate category rule"
+                              : "Activate category rule"}
+                          </Button>
+                        </form>
+                      </CardContent>
+                    </Card>
+                  </div>
                 </div>
               </div>
             ) : null}

@@ -14,7 +14,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { getAccessSnapshot } from "@/lib/authz";
+import { getAccessSnapshot, type AccessSnapshot } from "@/lib/authz";
 import { formatMonthLabel } from "@/lib/format";
 
 type DashboardSummary = {
@@ -273,27 +273,30 @@ function EmptyState({
   );
 }
 
-async function getDashboardState(): Promise<LpDashboardState> {
-  const access = await getAccessSnapshot();
-  const userName = access.user.name;
-
+function getDashboardRedirectTarget(access: AccessSnapshot) {
   if (access.hasAdminAccess) {
-    redirect("/admin/dashboard");
+    return "/admin/dashboard";
   }
 
+  if (!access.hasLpAccess) {
+    if (access.hasStoreAccess) {
+      return "/store/dashboard";
+    }
+
+    if (access.hasOperationsAccess) {
+      return "/audit";
+    }
+  }
+
+  return null;
+}
+
+async function getDashboardState(access: AccessSnapshot): Promise<LpDashboardState> {
+  const userName = access.user.name;
+  const lpContext = access.lpContext;
+
   try {
-    const lpContext = access.lpContext;
-    const storeContext = access.storeContext;
-
     if (lpContext.lpIds.length === 0) {
-      if (storeContext.options.length > 0) {
-        redirect("/store/dashboard");
-      }
-
-      if (access.hasOperationsAccess) {
-        redirect("/audit");
-      }
-
       return {
         kind: "empty",
         userName,
@@ -469,7 +472,13 @@ async function getDashboardState(): Promise<LpDashboardState> {
 
 export default async function DashboardPage() {
   const access = await getAccessSnapshot();
-  const state = await getDashboardState();
+  const redirectTarget = getDashboardRedirectTarget(access);
+
+  if (redirectTarget) {
+    redirect(redirectTarget);
+  }
+
+  const state = await getDashboardState(access);
   const roleLabel = getRoleLabel(access.user.systemRole);
 
   return (

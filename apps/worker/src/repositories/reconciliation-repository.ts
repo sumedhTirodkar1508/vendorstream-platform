@@ -184,6 +184,23 @@ export class ReconciliationRepository {
           where: {
             lpId: cycle.lpId,
             isActive: true,
+            categoryRule: {
+              isActive: true,
+              AND: [
+                {
+                  OR: [
+                    { effectiveFrom: null },
+                    { effectiveFrom: { lte: cycle.periodMonth } },
+                  ],
+                },
+                {
+                  OR: [
+                    { effectiveTo: null },
+                    { effectiveTo: { gte: cycle.periodMonth } },
+                  ],
+                },
+              ],
+            },
             AND: [
               {
                 OR: [

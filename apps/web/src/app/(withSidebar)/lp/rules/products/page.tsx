@@ -3,11 +3,16 @@ import { getServerSession } from "next-auth";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import {
+  Prisma,
   prisma,
+  recordAuditLog,
   type LpMembershipRole,
-  type Prisma,
 } from "@vendorstream/database";
 import { authOptions } from "@/app/api/auth/[...nextauth]/options";
+import {
+  canManageLpRules,
+  MANAGEABLE_LP_RULE_ROLES,
+} from "@/lib/lp-rule-management-auth";
 import {
   Card,
   CardContent,
@@ -16,6 +21,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { ProductRuleSelector } from "@/components/lp-rules/product-rule-selector";
 
 type ActiveStatusFilter = "ACTIVE" | "INACTIVE";
 type CategoryFilter = string;
@@ -48,6 +54,7 @@ type ProductRuleRow = {
   categoryRuleId: string | null;
   categoryKey: string | null;
   categoryDisplayName: string | null;
+  categoryIsActive: boolean | null;
   productScale: string;
   isActive: boolean;
   effectiveFrom: Date | null;
@@ -101,7 +108,7 @@ type LpProductRulesState =
       message: string;
     };
 
-const MANAGEABLE_LP_ROLES: LpMembershipRole[] = ["LP_ADMIN", "LP_MANAGER"];
+const MANAGEABLE_LP_ROLES = MANAGEABLE_LP_RULE_ROLES;
 const ACTIVE_STATUS_OPTIONS: ActiveStatusFilter[] = ["ACTIVE", "INACTIVE"];
 const UNLINKED_CATEGORY_FILTER = "UNLINKED";
 
@@ -177,6 +184,45 @@ function getActiveTone(isActive: boolean) {
   return "border-red-400/30 bg-red-500/10 text-red-100";
 }
 
+function getCategoryTone(isActive: boolean | null) {
+  if (isActive === null) {
+    return "border-white/10 bg-white/5 text-slate-200";
+  }
+
+  return getActiveTone(isActive);
+}
+
+function getEffectiveStatus(
+  productIsActive: boolean,
+  categoryIsActive: boolean | null,
+) {
+  if (!productIsActive) {
+    return {
+      label: "Inactive",
+      tone: "border-red-400/30 bg-red-500/10 text-red-100",
+    };
+  }
+
+  if (categoryIsActive === false) {
+    return {
+      label: "Blocked by inactive category",
+      tone: "border-amber-400/30 bg-amber-500/10 text-amber-100",
+    };
+  }
+
+  if (categoryIsActive === null) {
+    return {
+      label: "Blocked by missing category",
+      tone: "border-slate-400/30 bg-slate-500/10 text-slate-200",
+    };
+  }
+
+  return {
+    label: "Effective",
+    tone: "border-emerald-400/30 bg-emerald-500/10 text-emerald-100",
+  };
+}
+
 function getRoleTone(role: LpMembershipRole) {
   if (role === "LP_ADMIN") {
     return "border-cyan-400/30 bg-cyan-400/10 text-cyan-100";
@@ -249,10 +295,33 @@ function getMutationBanner(mutation: string) {
     };
   }
 
+  if (mutation === "deleted") {
+    return {
+      tone: "success" as const,
+      message: "Product scale rule deleted successfully.",
+    };
+  }
+
   if (mutation === "invalid") {
     return {
       tone: "warning" as const,
-      message: "The submitted product scale rule action was invalid.",
+      message:
+        "Check the barcode, product name, active category, and product scale.",
+    };
+  }
+
+  if (mutation === "duplicate") {
+    return {
+      tone: "warning" as const,
+      message:
+        "A product scale rule with that barcode already exists for this LP.",
+    };
+  }
+
+  if (mutation === "conflict") {
+    return {
+      tone: "warning" as const,
+      message: "Product scale cannot exceed the selected category max scale.",
     };
   }
 
@@ -282,25 +351,93 @@ function getMutationBanner(mutation: string) {
   return null;
 }
 
-function parseDecimalInput(value: string, fieldName: string) {
+type ProductRuleFormValues = {
+  lpId: string;
+  ruleId: string;
+  category: string;
+  activeStatus: string;
+  barcode: string;
+  productNameSnapshot: string;
+  categoryRuleId: string;
+  productScale: string;
+  isActive: boolean;
+};
+
+function parsePositiveDecimalInput(value: string) {
   const trimmed = value.trim();
   const parsed = Number(trimmed);
 
   if (!trimmed || !Number.isFinite(parsed) || parsed <= 0) {
-    return {
-      ok: false as const,
-      error: `${fieldName} must be greater than 0.`,
-    };
+    return null;
   }
 
-  return {
-    ok: true as const,
-    value: parsed.toFixed(4),
-  };
+  return parsed.toFixed(4);
 }
 
 function isScientificNotationText(value: string): boolean {
   return /^[+-]?\d+(?:\.\d+)?e[+-]?\d+$/i.test(value.trim());
+}
+
+function parseProductRuleForm(formData: FormData) {
+  const lpId = String(formData.get("lpId") || "").trim();
+  const ruleId = String(formData.get("ruleId") || "").trim();
+  const category = String(formData.get("categoryFilter") || "").trim();
+  const activeStatus = String(formData.get("activeStatusFilter") || "").trim();
+  const barcode = String(formData.get("barcode") || "").trim();
+  const productNameSnapshot = String(
+    formData.get("productNameSnapshot") || "",
+  ).trim();
+  const categoryRuleId = String(formData.get("categoryRuleId") || "").trim();
+  const productScale = parsePositiveDecimalInput(
+    String(formData.get("productScale") || ""),
+  );
+
+  if (
+    !lpId ||
+    !barcode ||
+    isScientificNotationText(barcode) ||
+    !productNameSnapshot ||
+    !categoryRuleId ||
+    !productScale
+  ) {
+    return null;
+  }
+
+  return {
+    lpId,
+    ruleId,
+    category,
+    activeStatus,
+    barcode,
+    productNameSnapshot,
+    categoryRuleId,
+    productScale,
+    isActive: formData.get("isActive") === "on",
+  } satisfies ProductRuleFormValues;
+}
+
+function isUniqueConstraintError(error: unknown) {
+  return (
+    error instanceof Prisma.PrismaClientKnownRequestError &&
+    error.code === "P2002"
+  );
+}
+
+function addChangedField(
+  changedFields: Record<
+    string,
+    { previous: string | boolean | null; next: string | boolean | null }
+  >,
+  fieldName: string,
+  previous: string | boolean | null,
+  next: string | boolean | null,
+) {
+  if (previous !== next) {
+    changedFields[fieldName] = {
+      previous,
+      next,
+    };
+  }
 }
 
 async function saveProductRule(formData: FormData) {
@@ -312,20 +449,11 @@ async function saveProductRule(formData: FormData) {
     redirect("/login");
   }
 
+  const parsed = parseProductRuleForm(formData);
   const lpId = String(formData.get("lpId") || "").trim();
   const ruleId = String(formData.get("ruleId") || "").trim();
   const category = String(formData.get("categoryFilter") || "").trim();
   const activeStatus = String(formData.get("activeStatusFilter") || "").trim();
-  const barcode = String(formData.get("barcode") || "").trim();
-  const productNameSnapshot = String(
-    formData.get("productNameSnapshot") || "",
-  ).trim();
-  const categoryRuleId = String(formData.get("categoryRuleId") || "").trim();
-  const productScaleResult = parseDecimalInput(
-    String(formData.get("productScale") || ""),
-    "Product scale",
-  );
-  const isActive = formData.get("isActive") === "on";
 
   const filters = {
     lpId,
@@ -334,138 +462,269 @@ async function saveProductRule(formData: FormData) {
     ruleId,
   };
 
+  if (!parsed) {
+    redirect(
+      buildProductRulesHref({
+        ...filters,
+        mutation: "invalid",
+      }),
+    );
+  }
+
+  const actorUserId = session.user.id;
+
+  if (!actorUserId) {
+    redirect(
+      buildProductRulesHref({
+        ...filters,
+        mutation: "forbidden",
+      }),
+    );
+  }
+
   if (
-    !lpId ||
-    !barcode ||
-    isScientificNotationText(barcode) ||
-    !categoryRuleId ||
-    !productScaleResult.ok
+    !(await canManageLpRules({
+      actor: {
+        userId: actorUserId,
+        systemRole: session.user.systemRole,
+      },
+      lpId: parsed.lpId,
+    }))
   ) {
     redirect(
       buildProductRulesHref({
         ...filters,
-        mutation: "invalid",
-      }),
-    );
-  }
-
-  if (!session.user.id) {
-    redirect(
-      buildProductRulesHref({
-        ...filters,
         mutation: "forbidden",
       }),
     );
   }
 
-  const membership = await prisma.lpMembership.findFirst({
-    where: {
-      userId: session.user.id,
-      lpId,
-    },
-    select: {
-      role: true,
-    },
-  });
-
-  const canManageRules =
-    session.user.systemRole === "ADMIN" ||
-    (membership ? MANAGEABLE_LP_ROLES.includes(membership.role) : false);
-
-  if (!canManageRules) {
-    redirect(
-      buildProductRulesHref({
-        ...filters,
-        mutation: "forbidden",
-      }),
-    );
-  }
-
-  const categoryRule = await prisma.categoryRule.findFirst({
-    where: {
-      id: categoryRuleId,
-      lpId,
-      isActive: true,
-    },
-    select: {
-      id: true,
-    },
-  });
-
-  if (!categoryRule) {
-    redirect(
-      buildProductRulesHref({
-        ...filters,
-        mutation: "invalid",
-      }),
-    );
-  }
-
-  if (ruleId) {
-    const existingRule = await prisma.productScaleRule.findFirst({
-      where: {
-        id: ruleId,
-        lpId,
-      },
-      select: {
-        id: true,
-      },
-    });
-
-    if (!existingRule) {
-      redirect(
-        buildProductRulesHref({
-          ...filters,
-          mutation: "not_found",
-        }),
-      );
-    }
-  }
+  let result:
+    | { status: "created" | "updated"; ruleId: string }
+    | {
+        status: "duplicate" | "not_found" | "invalid" | "conflict";
+        ruleId: string;
+      };
 
   try {
-    if (ruleId) {
-      await prisma.productScaleRule.update({
+    result = await prisma.$transaction(async (tx) => {
+      const existingRule = parsed.ruleId
+        ? await tx.productScaleRule.findFirst({
+            where: {
+              id: parsed.ruleId,
+              lpId: parsed.lpId,
+            },
+            select: {
+              id: true,
+              barcode: true,
+              productNameSnapshot: true,
+              categoryRuleId: true,
+              productScale: true,
+              isActive: true,
+            },
+          })
+        : null;
+
+      if (parsed.ruleId && !existingRule) {
+        return {
+          status: "not_found" as const,
+          ruleId: parsed.ruleId,
+        };
+      }
+
+      const categoryRule = await tx.categoryRule.findFirst({
         where: {
-          id: ruleId,
+          id: parsed.categoryRuleId,
+          lpId: parsed.lpId,
         },
-        data: {
-          barcode,
-          productNameSnapshot: productNameSnapshot || null,
-          categoryRuleId,
-          productScale: productScaleResult.value,
-          isActive,
+        select: {
+          id: true,
+          categoryKey: true,
+          maxScale: true,
+          isActive: true,
         },
       });
-    }
 
-    const savedRule = ruleId
-      ? { id: ruleId }
-      : await prisma.productScaleRule.create({
-          data: {
-            lpId,
-            barcode,
-            productNameSnapshot: productNameSnapshot || null,
-            categoryRuleId,
-            productScale: productScaleResult.value,
-            isActive,
+      if (!categoryRule) {
+        return {
+          status: "invalid" as const,
+          ruleId: parsed.ruleId,
+        };
+      }
+
+      const isCategoryChange =
+        !existingRule || existingRule.categoryRuleId !== categoryRule.id;
+
+      if (!categoryRule.isActive && isCategoryChange) {
+        return {
+          status: "invalid" as const,
+          ruleId: parsed.ruleId,
+        };
+      }
+
+      if (
+        Number(parsed.productScale) > Number(categoryRule.maxScale.toString())
+      ) {
+        return {
+          status: "conflict" as const,
+          ruleId: parsed.ruleId,
+        };
+      }
+
+      const duplicateRule = await tx.productScaleRule.findFirst({
+        where: {
+          lpId: parsed.lpId,
+          barcode: parsed.barcode,
+          ...(parsed.ruleId ? { NOT: { id: parsed.ruleId } } : {}),
+        },
+        select: {
+          id: true,
+        },
+      });
+
+      if (duplicateRule) {
+        return {
+          status: "duplicate" as const,
+          ruleId: parsed.ruleId,
+        };
+      }
+
+      if (parsed.ruleId && existingRule) {
+        await tx.productScaleRule.update({
+          where: {
+            id: parsed.ruleId,
           },
-          select: {
-            id: true,
+          data: {
+            barcode: parsed.barcode,
+            productNameSnapshot: parsed.productNameSnapshot,
+            categoryRuleId: parsed.categoryRuleId,
+            productScale: parsed.productScale,
+            isActive: parsed.isActive,
           },
         });
 
-    revalidatePath("/lp/rules/products");
+        const changedFields: Record<
+          string,
+          { previous: string | boolean | null; next: string | boolean | null }
+        > = {};
 
-    redirect(
-      buildProductRulesHref({
-        lpId,
-        category: "",
-        activeStatus,
+        addChangedField(
+          changedFields,
+          "barcode",
+          existingRule.barcode,
+          parsed.barcode,
+        );
+        addChangedField(
+          changedFields,
+          "productNameSnapshot",
+          existingRule.productNameSnapshot,
+          parsed.productNameSnapshot,
+        );
+        addChangedField(
+          changedFields,
+          "categoryRuleId",
+          existingRule.categoryRuleId,
+          parsed.categoryRuleId,
+        );
+        addChangedField(
+          changedFields,
+          "productScale",
+          existingRule.productScale.toFixed(4),
+          parsed.productScale,
+        );
+        addChangedField(
+          changedFields,
+          "isActive",
+          existingRule.isActive,
+          parsed.isActive,
+        );
+
+        await recordAuditLog(tx, {
+          actorType: "USER",
+          actorUserId,
+          action: "product_scale_rule.updated",
+          entityType: "PRODUCT_SCALE_RULE",
+          entityId: parsed.ruleId,
+          metadata: {
+            lpId: parsed.lpId,
+            ruleId: parsed.ruleId,
+            barcode: parsed.barcode,
+            categoryRuleId: parsed.categoryRuleId,
+            categoryKey: categoryRule.categoryKey,
+            changedFields,
+          },
+        });
+
+        if (existingRule.isActive !== parsed.isActive) {
+          await recordAuditLog(tx, {
+            actorType: "USER",
+            actorUserId,
+            action: parsed.isActive
+              ? "product_scale_rule.activated"
+              : "product_scale_rule.deactivated",
+            entityType: "PRODUCT_SCALE_RULE",
+            entityId: parsed.ruleId,
+            metadata: {
+              lpId: parsed.lpId,
+              ruleId: parsed.ruleId,
+              barcode: parsed.barcode,
+              previousActiveState: existingRule.isActive,
+              nextActiveState: parsed.isActive,
+            },
+          });
+        }
+
+        return {
+          status: "updated" as const,
+          ruleId: parsed.ruleId,
+        };
+      }
+
+      const savedRule = await tx.productScaleRule.create({
+        data: {
+          lpId: parsed.lpId,
+          barcode: parsed.barcode,
+          productNameSnapshot: parsed.productNameSnapshot,
+          categoryRuleId: parsed.categoryRuleId,
+          productScale: parsed.productScale,
+          isActive: parsed.isActive,
+        },
+        select: {
+          id: true,
+        },
+      });
+
+      await recordAuditLog(tx, {
+        actorType: "USER",
+        actorUserId,
+        action: "product_scale_rule.created",
+        entityType: "PRODUCT_SCALE_RULE",
+        entityId: savedRule.id,
+        metadata: {
+          lpId: parsed.lpId,
+          ruleId: savedRule.id,
+          barcode: parsed.barcode,
+          categoryRuleId: parsed.categoryRuleId,
+          categoryKey: categoryRule.categoryKey,
+          isActive: parsed.isActive,
+        },
+      });
+
+      return {
+        status: "created" as const,
         ruleId: savedRule.id,
-        mutation: ruleId ? "updated" : "created",
-      }),
-    );
+      };
+    });
   } catch (error) {
+    if (isUniqueConstraintError(error)) {
+      redirect(
+        buildProductRulesHref({
+          ...filters,
+          mutation: "duplicate",
+        }),
+      );
+    }
+
     console.error("Failed to save product scale rule", error);
 
     redirect(
@@ -475,6 +734,31 @@ async function saveProductRule(formData: FormData) {
       }),
     );
   }
+
+  if (
+    result.status === "duplicate" ||
+    result.status === "not_found" ||
+    result.status === "invalid" ||
+    result.status === "conflict"
+  ) {
+    redirect(
+      buildProductRulesHref({
+        ...filters,
+        mutation: result.status,
+      }),
+    );
+  }
+
+  revalidatePath("/lp/rules/products");
+  redirect(
+    buildProductRulesHref({
+      lpId: parsed.lpId,
+      category: "",
+      activeStatus: parsed.activeStatus,
+      ruleId: result.ruleId,
+      mutation: result.status,
+    }),
+  );
 }
 
 async function toggleProductRuleStatus(formData: FormData) {
@@ -508,7 +792,9 @@ async function toggleProductRuleStatus(formData: FormData) {
     );
   }
 
-  if (!session.user.id) {
+  const actorUserId = session.user.id;
+
+  if (!actorUserId) {
     redirect(
       buildProductRulesHref({
         ...filters,
@@ -517,21 +803,15 @@ async function toggleProductRuleStatus(formData: FormData) {
     );
   }
 
-  const membership = await prisma.lpMembership.findFirst({
-    where: {
-      userId: session.user.id,
+  if (
+    !(await canManageLpRules({
+      actor: {
+        userId: actorUserId,
+        systemRole: session.user.systemRole,
+      },
       lpId,
-    },
-    select: {
-      role: true,
-    },
-  });
-
-  const canManageRules =
-    session.user.systemRole === "ADMIN" ||
-    (membership ? MANAGEABLE_LP_ROLES.includes(membership.role) : false);
-
-  if (!canManageRules) {
+    }))
+  ) {
     redirect(
       buildProductRulesHref({
         ...filters,
@@ -539,42 +819,61 @@ async function toggleProductRuleStatus(formData: FormData) {
       }),
     );
   }
+
+  let result: { status: "activated" | "deactivated" | "not_found" };
 
   try {
-    const rule = await prisma.productScaleRule.findFirst({
-      where: {
-        id: ruleId,
-        lpId,
-      },
-      select: {
-        id: true,
-      },
+    result = await prisma.$transaction(async (tx) => {
+      const rule = await tx.productScaleRule.findFirst({
+        where: {
+          id: ruleId,
+          lpId,
+        },
+        select: {
+          id: true,
+          barcode: true,
+          isActive: true,
+        },
+      });
+
+      if (!rule) {
+        return {
+          status: "not_found" as const,
+        };
+      }
+
+      const nextIsActive = nextStatus === "ACTIVE";
+
+      await tx.productScaleRule.update({
+        where: { id: ruleId },
+        data: {
+          isActive: nextIsActive,
+        },
+      });
+
+      await recordAuditLog(tx, {
+        actorType: "USER",
+        actorUserId,
+        action: nextIsActive
+          ? "product_scale_rule.activated"
+          : "product_scale_rule.deactivated",
+        entityType: "PRODUCT_SCALE_RULE",
+        entityId: ruleId,
+        metadata: {
+          lpId,
+          ruleId,
+          barcode: rule.barcode,
+          previousActiveState: rule.isActive,
+          nextActiveState: nextIsActive,
+        },
+      });
+
+      return {
+        status: nextIsActive
+          ? ("activated" as const)
+          : ("deactivated" as const),
+      };
     });
-
-    if (!rule) {
-      redirect(
-        buildProductRulesHref({
-          ...filters,
-          mutation: "not_found",
-        }),
-      );
-    }
-
-    await prisma.productScaleRule.update({
-      where: { id: ruleId },
-      data: {
-        isActive: nextStatus === "ACTIVE",
-      },
-    });
-
-    revalidatePath("/lp/rules/products");
-
-    redirect(
-      buildProductRulesHref({
-        ...filters,
-        mutation: nextStatus === "ACTIVE" ? "activated" : "deactivated",
-      }),
-    );
   } catch (error) {
     console.error("Failed to update product scale rule status", error);
 
@@ -585,6 +884,153 @@ async function toggleProductRuleStatus(formData: FormData) {
       }),
     );
   }
+
+  if (result.status === "not_found") {
+    redirect(
+      buildProductRulesHref({
+        ...filters,
+        mutation: "not_found",
+      }),
+    );
+  }
+
+  revalidatePath("/lp/rules/products");
+  redirect(
+    buildProductRulesHref({
+      ...filters,
+      mutation: result.status,
+    }),
+  );
+}
+
+async function deleteProductRule(formData: FormData) {
+  "use server";
+
+  const session = await getServerSession(authOptions);
+
+  if (!session?.user) {
+    redirect("/login");
+  }
+
+  const lpId = String(formData.get("lpId") || "").trim();
+  const ruleId = String(formData.get("ruleId") || "").trim();
+  const category = String(formData.get("categoryFilter") || "").trim();
+  const activeStatus = String(formData.get("activeStatusFilter") || "").trim();
+
+  const filters = {
+    lpId,
+    category,
+    activeStatus,
+    ruleId,
+  };
+
+  if (!lpId || !ruleId) {
+    redirect(
+      buildProductRulesHref({
+        ...filters,
+        mutation: "invalid",
+      }),
+    );
+  }
+
+  const actorUserId = session.user.id;
+
+  if (!actorUserId) {
+    redirect(
+      buildProductRulesHref({
+        ...filters,
+        mutation: "forbidden",
+      }),
+    );
+  }
+
+  if (
+    !(await canManageLpRules({
+      actor: {
+        userId: actorUserId,
+        systemRole: session.user.systemRole,
+      },
+      lpId,
+    }))
+  ) {
+    redirect(
+      buildProductRulesHref({
+        ...filters,
+        mutation: "forbidden",
+      }),
+    );
+  }
+
+  let result: { status: "deleted" | "not_found" };
+
+  try {
+    result = await prisma.$transaction(async (tx) => {
+      const rule = await tx.productScaleRule.findFirst({
+        where: {
+          id: ruleId,
+          lpId,
+        },
+        select: {
+          id: true,
+          barcode: true,
+          isActive: true,
+        },
+      });
+
+      if (!rule) {
+        return { status: "not_found" as const };
+      }
+
+      await tx.productScaleRule.delete({
+        where: { id: ruleId },
+      });
+
+      await recordAuditLog(tx, {
+        actorType: "USER",
+        actorUserId,
+        action: "product_scale_rule.deleted",
+        entityType: "PRODUCT_SCALE_RULE",
+        entityId: ruleId,
+        metadata: {
+          lpId,
+          ruleId,
+          barcode: rule.barcode,
+          previousActiveState: rule.isActive,
+        },
+      });
+
+      return { status: "deleted" as const };
+    });
+  } catch (error) {
+    console.error("Failed to delete product scale rule", error);
+
+    redirect(
+      buildProductRulesHref({
+        ...filters,
+        mutation: "error",
+      }),
+    );
+  }
+
+  if (result.status === "not_found") {
+    redirect(
+      buildProductRulesHref({
+        ...filters,
+        mutation: "not_found",
+      }),
+    );
+  }
+
+  revalidatePath("/lp/rules/products");
+  redirect(
+    buildProductRulesHref({
+      lpId,
+      category,
+      activeStatus,
+      ruleId: "",
+      mutation: "deleted",
+    }),
+  );
 }
 
 async function getLpProductRulesState(
@@ -615,13 +1061,15 @@ async function getLpProductRulesState(
       return { kind: "forbidden" };
     }
 
-    const availableContexts: LpContextOption[] = memberships.map((membership) => ({
-      membershipId: membership.id,
-      lpId: membership.lp.id,
-      lpName: membership.lp.name,
-      lpCode: membership.lp.code,
-      membershipRole: membership.role,
-    }));
+    const availableContexts: LpContextOption[] = memberships.map(
+      (membership) => ({
+        membershipId: membership.id,
+        lpId: membership.lp.id,
+        lpName: membership.lp.name,
+        lpCode: membership.lp.code,
+        membershipRole: membership.role,
+      }),
+    );
 
     const currentMembership =
       availableContexts.find((context) => context.lpId === filters.lpId) ??
@@ -637,7 +1085,8 @@ async function getLpProductRulesState(
       ? (filters.activeStatus as ActiveStatusFilter)
       : undefined;
 
-    const categoryFilter: CategoryFilter | undefined = filters.category || undefined;
+    const categoryFilter: CategoryFilter | undefined =
+      filters.category || undefined;
 
     const where = {
       lpId: currentMembership.lpId,
@@ -710,6 +1159,7 @@ async function getLpProductRulesState(
               id: true,
               categoryKey: true,
               displayName: true,
+              isActive: true,
             },
           },
         },
@@ -762,6 +1212,7 @@ async function getLpProductRulesState(
       categoryRuleId: row.categoryRule?.id ?? null,
       categoryKey: row.categoryRule?.categoryKey ?? null,
       categoryDisplayName: row.categoryRule?.displayName ?? null,
+      categoryIsActive: row.categoryRule?.isActive ?? null,
       productScale: formatDecimal(row.productScale),
       isActive: row.isActive,
       effectiveFrom: row.effectiveFrom,
@@ -771,7 +1222,9 @@ async function getLpProductRulesState(
     }));
 
     const selectedRule =
-      mappedRows.find((row) => row.id === filters.ruleId) ?? mappedRows[0] ?? null;
+      mappedRows.find((row) => row.id === filters.ruleId) ??
+      mappedRows[0] ??
+      null;
 
     return {
       kind: "ready",
@@ -952,8 +1405,12 @@ export default async function LpProductRulesPage({
                     label="Membership role"
                     value={
                       <StatusBadge
-                        label={formatEnumLabel(state.currentContext.membershipRole)}
-                        className={getRoleTone(state.currentContext.membershipRole)}
+                        label={formatEnumLabel(
+                          state.currentContext.membershipRole,
+                        )}
+                        className={getRoleTone(
+                          state.currentContext.membershipRole,
+                        )}
                       />
                     }
                   />
@@ -975,7 +1432,9 @@ export default async function LpProductRulesPage({
                   />
                   <DetailRow
                     label="Rule permissions"
-                    value={state.canManageRules ? "Manage enabled" : "View only"}
+                    value={
+                      state.canManageRules ? "Manage enabled" : "View only"
+                    }
                   />
                 </div>
 
@@ -1083,7 +1542,11 @@ export default async function LpProductRulesPage({
                   </div>
 
                   <div className="flex items-end gap-3">
-                    <input type="hidden" name="lpId" value={state.currentContext.lpId} />
+                    <input
+                      type="hidden"
+                      name="lpId"
+                      value={state.currentContext.lpId}
+                    />
                     <Button
                       type="submit"
                       className="bg-white text-slate-950 hover:bg-slate-100"
@@ -1121,8 +1584,9 @@ export default async function LpProductRulesPage({
                       Product scale rules
                     </CardTitle>
                     <CardDescription className="text-sm leading-6 text-slate-300">
-                      Real `ProductScaleRule` records for the active LP workspace,
-                      including linked category rule context where available.
+                      Real `ProductScaleRule` records for the active LP
+                      workspace, including linked category rule context where
+                      available.
                     </CardDescription>
                   </div>
                   <form
@@ -1153,6 +1617,7 @@ export default async function LpProductRulesPage({
                     />
                     <input
                       name="productNameSnapshot"
+                      required
                       placeholder="Product name"
                       className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
                     />
@@ -1164,7 +1629,9 @@ export default async function LpProductRulesPage({
                       >
                         <option value="">Choose category</option>
                         {state.categoryOptions
-                          .filter((option) => option.id !== UNLINKED_CATEGORY_FILTER)
+                          .filter(
+                            (option) => option.id !== UNLINKED_CATEGORY_FILTER,
+                          )
                           .map((option) => (
                             <option key={option.id} value={option.id}>
                               {option.label}
@@ -1202,8 +1669,8 @@ export default async function LpProductRulesPage({
               <CardContent>
                 {state.kind === "empty" ? (
                   <div className="rounded-2xl border border-dashed border-white/15 bg-slate-950/30 px-4 py-5 text-sm text-slate-400">
-                    No product scale rules match the current LP context and filter
-                    set.
+                    No product scale rules match the current LP context and
+                    filter set.
                   </div>
                 ) : (
                   <div className="overflow-x-auto rounded-2xl border border-white/8 bg-slate-950/35">
@@ -1215,10 +1682,24 @@ export default async function LpProductRulesPage({
                             Product name snapshot
                           </th>
                           <th className="px-4 py-3 font-medium">Category</th>
-                          <th className="px-4 py-3 font-medium">Product scale</th>
-                          <th className="px-4 py-3 font-medium">Active status</th>
-                          <th className="px-4 py-3 font-medium">Effective from</th>
-                          <th className="px-4 py-3 font-medium">Effective to</th>
+                          <th className="px-4 py-3 font-medium">
+                            Category status
+                          </th>
+                          <th className="px-4 py-3 font-medium">
+                            Product scale
+                          </th>
+                          <th className="px-4 py-3 font-medium">
+                            Product status
+                          </th>
+                          <th className="px-4 py-3 font-medium">
+                            Effective status
+                          </th>
+                          <th className="px-4 py-3 font-medium">
+                            Effective from
+                          </th>
+                          <th className="px-4 py-3 font-medium">
+                            Effective to
+                          </th>
                           <th className="px-4 py-3 font-medium">Actions</th>
                         </tr>
                       </thead>
@@ -1227,7 +1708,9 @@ export default async function LpProductRulesPage({
                           <tr
                             key={row.id}
                             className={`border-b border-white/8 last:border-b-0 ${
-                              row.id === state.selectedRule?.id ? "bg-cyan-400/8" : ""
+                              row.id === state.selectedRule?.id
+                                ? "bg-cyan-400/8"
+                                : ""
                             }`}
                           >
                             <td className="px-4 py-4 text-sm font-medium text-white">
@@ -1239,7 +1722,21 @@ export default async function LpProductRulesPage({
                             <td className="px-4 py-4 text-sm text-slate-300">
                               {row.categoryDisplayName
                                 ? `${row.categoryDisplayName} · ${row.categoryKey}`
-                                : row.categoryKey ?? "Unlinked"}
+                                : (row.categoryKey ?? "Unlinked")}
+                            </td>
+                            <td className="px-4 py-4 text-sm text-slate-300">
+                              <StatusBadge
+                                label={
+                                  row.categoryIsActive === null
+                                    ? "Unlinked"
+                                    : row.categoryIsActive
+                                      ? "Active"
+                                      : "Inactive"
+                                }
+                                className={getCategoryTone(
+                                  row.categoryIsActive,
+                                )}
+                              />
                             </td>
                             <td className="px-4 py-4 text-sm text-slate-300">
                               {row.productScale}
@@ -1251,6 +1748,22 @@ export default async function LpProductRulesPage({
                               />
                             </td>
                             <td className="px-4 py-4 text-sm text-slate-300">
+                              <StatusBadge
+                                label={
+                                  getEffectiveStatus(
+                                    row.isActive,
+                                    row.categoryIsActive,
+                                  ).label
+                                }
+                                className={
+                                  getEffectiveStatus(
+                                    row.isActive,
+                                    row.categoryIsActive,
+                                  ).tone
+                                }
+                              />
+                            </td>
+                            <td className="px-4 py-4 text-sm text-slate-300">
                               {formatDate(row.effectiveFrom)}
                             </td>
                             <td className="px-4 py-4 text-sm text-slate-300">
@@ -1258,24 +1771,37 @@ export default async function LpProductRulesPage({
                             </td>
                             <td className="px-4 py-4 text-sm">
                               <div className="flex flex-wrap gap-2">
-                                <Button
-                                  asChild
-                                  size="sm"
-                                  variant="ghost"
-                                  className="text-slate-300 hover:bg-white/5 hover:text-white"
-                                >
-                                  <Link
-                                    href={buildProductRulesHref({
-                                      lpId: state.currentContext.lpId,
-                                      category: state.filters.category,
-                                      activeStatus: state.filters.activeStatus,
-                                      ruleId: row.id,
-                                      mutation: undefined,
-                                    })}
+                                <form action={deleteProductRule}>
+                                  <input
+                                    type="hidden"
+                                    name="lpId"
+                                    value={state.currentContext.lpId}
+                                  />
+                                  <input
+                                    type="hidden"
+                                    name="ruleId"
+                                    value={row.id}
+                                  />
+                                  <input
+                                    type="hidden"
+                                    name="categoryFilter"
+                                    value={state.filters.category}
+                                  />
+                                  <input
+                                    type="hidden"
+                                    name="activeStatusFilter"
+                                    value={state.filters.activeStatus}
+                                  />
+                                  <Button
+                                    type="submit"
+                                    size="sm"
+                                    variant="outline"
+                                    disabled={!state.canManageRules}
+                                    className="border-red-400/20 bg-red-500/10 text-red-100 hover:bg-red-500/20 disabled:text-slate-500"
                                   >
-                                    Edit rule
-                                  </Link>
-                                </Button>
+                                    Delete rule
+                                  </Button>
+                                </form>
 
                                 <form action={toggleProductRuleStatus}>
                                   <input
@@ -1351,153 +1877,247 @@ export default async function LpProductRulesPage({
             </Card>
 
             {state.kind === "ready" && state.selectedRule ? (
-              <div className="grid gap-4 xl:grid-cols-[1fr_0.9fr]">
+              <div className="space-y-4">
                 <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
                   <CardHeader className="space-y-2">
-                    <CardTitle className="text-xl text-white">
-                      Product rule details
+                    <CardTitle className="text-lg text-white">
+                      Selected product rule
                     </CardTitle>
                     <CardDescription className="text-sm leading-6 text-slate-300">
-                      Review the selected product scale rule and linked
-                      category-rule context.
+                      Choose a product rule to view details, edit, or manage.
                     </CardDescription>
                   </CardHeader>
-                  <CardContent className="grid gap-3">
-                    <DetailRow label="Rule ID" value={state.selectedRule.id} />
-                    <DetailRow label="Barcode" value={state.selectedRule.barcode} />
-                    <DetailRow
-                      label="Product name snapshot"
-                      value={
-                        state.selectedRule.productNameSnapshot ?? "Not captured"
-                      }
-                    />
-                    <DetailRow
-                      label="Product scale"
-                      value={state.selectedRule.productScale}
-                    />
-                    <DetailRow
-                      label="Status"
-                      value={
-                        <StatusBadge
-                          label={
-                            state.selectedRule.isActive ? "Active" : "Inactive"
-                          }
-                          className={getActiveTone(state.selectedRule.isActive)}
-                        />
-                      }
-                    />
-                    <DetailRow
-                      label="Category"
-                      value={
-                        state.selectedRule.categoryDisplayName
-                          ? `${state.selectedRule.categoryDisplayName} · ${state.selectedRule.categoryKey}`
-                          : state.selectedRule.categoryKey ?? "Unlinked"
-                      }
-                    />
-                    <DetailRow
-                      label="Effective from"
-                      value={formatDate(state.selectedRule.effectiveFrom)}
-                    />
-                    <DetailRow
-                      label="Effective to"
-                      value={formatDate(state.selectedRule.effectiveTo)}
-                    />
-                    <DetailRow
-                      label="Created at"
-                      value={formatDateTime(state.selectedRule.createdAt)}
-                    />
-                    <DetailRow
-                      label="Updated at"
-                      value={formatDateTime(state.selectedRule.updatedAt)}
+                  <CardContent>
+                    <ProductRuleSelector
+                      lpId={state.currentContext.lpId}
+                      selectedRuleId={state.selectedRule?.id ?? ""}
+                      category={state.filters.category}
+                      activeStatus={state.filters.activeStatus}
+                      rules={state.rows.map((rule) => ({
+                        id: rule.id,
+                        label: rule.productNameSnapshot
+                          ? `${rule.productNameSnapshot} · ${rule.barcode}`
+                          : rule.barcode,
+                      }))}
                     />
                   </CardContent>
                 </Card>
 
-                <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
-                  <CardHeader className="space-y-2">
-                    <CardTitle className="text-xl text-white">
-                      Edit product rule
-                    </CardTitle>
-                    <CardDescription className="text-sm leading-6 text-slate-300">
-                      Update barcode, category link, scale, and activation.
-                    </CardDescription>
-                  </CardHeader>
-                  <CardContent>
-                    <form action={saveProductRule} className="grid gap-3">
-                      <input
-                        type="hidden"
-                        name="lpId"
-                        value={state.currentContext.lpId}
-                      />
-                      <input
-                        type="hidden"
-                        name="ruleId"
+                <div className="grid gap-4 xl:grid-cols-[1fr_0.9fr]">
+                  <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
+                    <CardHeader className="space-y-2">
+                      <CardTitle className="text-xl text-white">
+                        Product rule details
+                      </CardTitle>
+                      <CardDescription className="text-sm leading-6 text-slate-300">
+                        Review the selected product scale rule and linked
+                        category-rule context.
+                      </CardDescription>
+                    </CardHeader>
+                    <CardContent className="grid gap-3">
+                      <DetailRow
+                        label="Rule ID"
                         value={state.selectedRule.id}
                       />
-                      <input
-                        type="hidden"
-                        name="categoryFilter"
-                        value={state.filters.category}
+                      <DetailRow
+                        label="Barcode"
+                        value={state.selectedRule.barcode}
                       />
-                      <input
-                        type="hidden"
-                        name="activeStatusFilter"
-                        value={state.filters.activeStatus}
-                      />
-                      <input
-                        name="barcode"
-                        required
-                        defaultValue={state.selectedRule.barcode}
-                        className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
-                      />
-                      <input
-                        name="productNameSnapshot"
-                        defaultValue={
-                          state.selectedRule.productNameSnapshot ?? ""
+                      <DetailRow
+                        label="Product name snapshot"
+                        value={
+                          state.selectedRule.productNameSnapshot ??
+                          "Not captured"
                         }
-                        className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
                       />
-                      <select
-                        name="categoryRuleId"
-                        required
-                        defaultValue={state.selectedRule.categoryRuleId ?? ""}
-                        className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
-                      >
-                        <option value="">Choose category</option>
-                        {state.categoryOptions
-                          .filter((option) => option.id !== UNLINKED_CATEGORY_FILTER)
-                          .map((option) => (
-                            <option key={option.id} value={option.id}>
-                              {option.label}
-                            </option>
-                          ))}
-                      </select>
-                      <input
-                        name="productScale"
-                        required
-                        inputMode="decimal"
-                        defaultValue={state.selectedRule.productScale}
-                        className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
+                      <DetailRow
+                        label="Product scale"
+                        value={state.selectedRule.productScale}
                       />
-                      <label className="flex items-center gap-2 text-xs text-slate-300">
+                      <DetailRow
+                        label="Status"
+                        value={
+                          <StatusBadge
+                            label={
+                              state.selectedRule.isActive
+                                ? "Active"
+                                : "Inactive"
+                            }
+                            className={getActiveTone(
+                              state.selectedRule.isActive,
+                            )}
+                          />
+                        }
+                      />
+                      <DetailRow
+                        label="Category"
+                        value={
+                          state.selectedRule.categoryDisplayName
+                            ? `${state.selectedRule.categoryDisplayName} · ${state.selectedRule.categoryKey}`
+                            : (state.selectedRule.categoryKey ?? "Unlinked")
+                        }
+                      />
+                      <DetailRow
+                        label="Category status"
+                        value={
+                          <StatusBadge
+                            label={
+                              state.selectedRule.categoryIsActive === null
+                                ? "Unlinked"
+                                : state.selectedRule.categoryIsActive
+                                  ? "Active"
+                                  : "Inactive"
+                            }
+                            className={getCategoryTone(
+                              state.selectedRule.categoryIsActive,
+                            )}
+                          />
+                        }
+                      />
+                      <DetailRow
+                        label="Effective status"
+                        value={
+                          <StatusBadge
+                            label={
+                              getEffectiveStatus(
+                                state.selectedRule.isActive,
+                                state.selectedRule.categoryIsActive,
+                              ).label
+                            }
+                            className={
+                              getEffectiveStatus(
+                                state.selectedRule.isActive,
+                                state.selectedRule.categoryIsActive,
+                              ).tone
+                            }
+                          />
+                        }
+                      />
+                      <DetailRow
+                        label="Effective from"
+                        value={formatDate(state.selectedRule.effectiveFrom)}
+                      />
+                      <DetailRow
+                        label="Effective to"
+                        value={formatDate(state.selectedRule.effectiveTo)}
+                      />
+                      <DetailRow
+                        label="Created at"
+                        value={formatDateTime(state.selectedRule.createdAt)}
+                      />
+                      <DetailRow
+                        label="Updated at"
+                        value={formatDateTime(state.selectedRule.updatedAt)}
+                      />
+                    </CardContent>
+                  </Card>
+
+                  <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
+                    <CardHeader className="space-y-2">
+                      <CardTitle className="text-xl text-white">
+                        Edit product rule
+                      </CardTitle>
+                      <CardDescription className="text-sm leading-6 text-slate-300">
+                        Update barcode, category link, scale, and activation.
+                      </CardDescription>
+                    </CardHeader>
+                    <CardContent>
+                      <form action={saveProductRule} className="grid gap-3">
                         <input
-                          type="checkbox"
-                          name="isActive"
-                          defaultChecked={state.selectedRule.isActive}
-                          className="size-4 accent-cyan-300"
+                          type="hidden"
+                          name="lpId"
+                          value={state.currentContext.lpId}
                         />
-                        Active
-                      </label>
-                      <Button
-                        type="submit"
-                        disabled={!state.canManageRules}
-                        className="w-full bg-cyan-400 text-slate-950 hover:bg-cyan-300 disabled:bg-white/20 disabled:text-slate-400"
-                      >
-                        Save product rule
-                      </Button>
-                    </form>
-                  </CardContent>
-                </Card>
+                        <input
+                          type="hidden"
+                          name="ruleId"
+                          value={state.selectedRule.id}
+                        />
+                        <input
+                          type="hidden"
+                          name="categoryFilter"
+                          value={state.filters.category}
+                        />
+                        <input
+                          type="hidden"
+                          name="activeStatusFilter"
+                          value={state.filters.activeStatus}
+                        />
+                        <input
+                          name="barcode"
+                          required
+                          defaultValue={state.selectedRule.barcode}
+                          className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
+                        />
+                        <input
+                          name="productNameSnapshot"
+                          required
+                          defaultValue={
+                            state.selectedRule.productNameSnapshot ?? ""
+                          }
+                          className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
+                        />
+                        <select
+                          name="categoryRuleId"
+                          required
+                          defaultValue={state.selectedRule.categoryRuleId ?? ""}
+                          className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
+                        >
+                          <option value="">Choose category</option>
+                          {state.selectedRule.categoryRuleId &&
+                          state.selectedRule.categoryIsActive === false ? (
+                            <option value={state.selectedRule.categoryRuleId}>
+                              Inactive:{" "}
+                              {state.selectedRule.categoryDisplayName
+                                ? `${state.selectedRule.categoryDisplayName} · ${state.selectedRule.categoryKey}`
+                                : (state.selectedRule.categoryKey ?? "Unknown")}
+                            </option>
+                          ) : null}
+                          {state.categoryOptions
+                            .filter(
+                              (option) =>
+                                option.id !== UNLINKED_CATEGORY_FILTER,
+                            )
+                            .map((option) => (
+                              <option key={option.id} value={option.id}>
+                                {option.label}
+                              </option>
+                            ))}
+                        </select>
+                        {state.selectedRule.categoryIsActive === false ? (
+                          <div className="rounded-xl border border-amber-400/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-100">
+                            This product rule is linked to an inactive category.
+                            You can keep it as-is or move it to an active
+                            category.
+                          </div>
+                        ) : null}
+                        <input
+                          name="productScale"
+                          required
+                          inputMode="decimal"
+                          defaultValue={state.selectedRule.productScale}
+                          className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
+                        />
+                        <label className="flex items-center gap-2 text-xs text-slate-300">
+                          <input
+                            type="checkbox"
+                            name="isActive"
+                            defaultChecked={state.selectedRule.isActive}
+                            className="size-4 accent-cyan-300"
+                          />
+                          Active
+                        </label>
+                        <Button
+                          type="submit"
+                          disabled={!state.canManageRules}
+                          className="w-full bg-cyan-400 text-slate-950 hover:bg-cyan-300 disabled:bg-white/20 disabled:text-slate-400"
+                        >
+                          Save product rule
+                        </Button>
+                      </form>
+                    </CardContent>
+                  </Card>
+                </div>
               </div>
             ) : null}
           </div>

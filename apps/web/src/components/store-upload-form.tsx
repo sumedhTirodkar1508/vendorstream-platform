@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useMemo, useRef, useState } from "react";
 import { runDirectImportUpload } from "@/lib/direct-upload-client";
 import {
@@ -66,6 +67,7 @@ export function StoreUploadForm({
   options,
   initialValues,
 }: StoreUploadFormProps) {
+  const router = useRouter();
   const initialAssignment =
     options.find(
       (option) =>
@@ -250,6 +252,13 @@ export function StoreUploadForm({
           payload.message ||
           `Store upload queued for validation for ${formatMonthLabel(month)}.`,
       });
+
+      const nextSearchParams = new URLSearchParams({
+        batchId: payload.importBatchId,
+        mutation: "queued",
+      });
+
+      router.push(`/store/uploads?${nextSearchParams.toString()}`);
     } catch (error) {
       setUploadProgress(0);
       setNotice({

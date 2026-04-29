@@ -3,6 +3,7 @@ import { getServerSession } from "next-auth";
 import { redirect } from "next/navigation";
 import { prisma, type $Enums } from "@vendorstream/database";
 import { authOptions } from "@/app/api/auth/[...nextauth]/options";
+import { BatchStatusPoller } from "@/components/batch-status-poller";
 import { formatMonthLabel } from "@/lib/format";
 import { getStoreUploadContextForUser } from "@/lib/store-upload-context";
 import {
@@ -52,6 +53,13 @@ type UploadFilters = {
   storeLocation: string;
   batchId: string;
 };
+
+type MutationBanner =
+  | {
+      tone: "success";
+      message: string;
+    }
+  | null;
 
 type StoreUploadsPageState =
   | {
@@ -273,6 +281,17 @@ function buildStoreUploadsHref(
 
   const query = params.toString();
   return query ? `/store/uploads?${query}` : "/store/uploads";
+}
+
+function getMutationBanner(mutation?: string): MutationBanner {
+  if (mutation === "queued") {
+    return {
+      tone: "success",
+      message: "Upload received and queued for validation.",
+    };
+  }
+
+  return null;
 }
 
 async function getStoreUploadsPageState(searchParams?: {
@@ -750,10 +769,12 @@ export default async function StoreUploadsPage({
     status?: string;
     storeLocation?: string;
     batchId?: string;
+    mutation?: string;
   }>;
 }) {
   const resolvedSearchParams = searchParams ? await searchParams : undefined;
   const state = await getStoreUploadsPageState(resolvedSearchParams);
+  const mutationBanner = getMutationBanner(resolvedSearchParams?.mutation);
 
   return (
     <main className="relative min-h-screen overflow-hidden text-white">
@@ -787,6 +808,59 @@ export default async function StoreUploadsPage({
 
         {state.kind === "ready" ? (
           <div className="space-y-6">
+            {state.selectedBatch ? (
+              <BatchStatusPoller status={state.selectedBatch.status} />
+            ) : null}
+
+            {mutationBanner ? (
+              <Card className="border border-emerald-400/20 bg-emerald-500/8 shadow-2xl backdrop-blur-xl">
+                <CardHeader className="space-y-2">
+                  <CardTitle className="text-xl text-white">
+                    Upload received
+                  </CardTitle>
+                  <CardDescription className="text-sm leading-6 text-emerald-100/90">
+                    {mutationBanner.message} Validation and reconciliation may
+                    still be in progress.
+                  </CardDescription>
+                </CardHeader>
+                {state.selectedBatch ? (
+                  <CardContent className="flex flex-wrap gap-3">
+                    <Button
+                      asChild
+                      className="bg-white text-slate-950 hover:bg-slate-100"
+                    >
+                      <Link
+                        href={buildStoreUploadsHref(
+                          state.filters,
+                          state.selectedBatch.id,
+                        )}
+                      >
+                        View store upload details
+                      </Link>
+                    </Button>
+                    <Button
+                      asChild
+                      variant="outline"
+                      className="border-white/15 bg-white/5 text-white hover:bg-white/10"
+                    >
+                      <Link href={`/store/cycles/${state.selectedBatch.cycleId}`}>
+                        Review cycle
+                      </Link>
+                    </Button>
+                    <Button
+                      asChild
+                      variant="outline"
+                      className="border-white/15 bg-white/5 text-white hover:bg-white/10"
+                    >
+                      <Link href="/store/dashboard">
+                        Return to store dashboard
+                      </Link>
+                    </Button>
+                  </CardContent>
+                ) : null}
+              </Card>
+            ) : null}
+
             <div className="rounded-2xl border border-cyan-400/20 bg-cyan-400/10 px-4 py-4 text-sm leading-6 text-cyan-100">
               Viewing uploads for{" "}
               <span className="font-medium text-white">
