@@ -235,6 +235,20 @@ function getMutationBanner(mutation: string) {
     };
   }
 
+  if (mutation === "created") {
+    return {
+      tone: "success" as const,
+      message: "Product scale rule created successfully.",
+    };
+  }
+
+  if (mutation === "updated") {
+    return {
+      tone: "success" as const,
+      message: "Product scale rule updated successfully.",
+    };
+  }
+
   if (mutation === "invalid") {
     return {
       tone: "warning" as const,
@@ -266,6 +280,201 @@ function getMutationBanner(mutation: string) {
   }
 
   return null;
+}
+
+function parseDecimalInput(value: string, fieldName: string) {
+  const trimmed = value.trim();
+  const parsed = Number(trimmed);
+
+  if (!trimmed || !Number.isFinite(parsed) || parsed <= 0) {
+    return {
+      ok: false as const,
+      error: `${fieldName} must be greater than 0.`,
+    };
+  }
+
+  return {
+    ok: true as const,
+    value: parsed.toFixed(4),
+  };
+}
+
+function isScientificNotationText(value: string): boolean {
+  return /^[+-]?\d+(?:\.\d+)?e[+-]?\d+$/i.test(value.trim());
+}
+
+async function saveProductRule(formData: FormData) {
+  "use server";
+
+  const session = await getServerSession(authOptions);
+
+  if (!session?.user) {
+    redirect("/login");
+  }
+
+  const lpId = String(formData.get("lpId") || "").trim();
+  const ruleId = String(formData.get("ruleId") || "").trim();
+  const category = String(formData.get("categoryFilter") || "").trim();
+  const activeStatus = String(formData.get("activeStatusFilter") || "").trim();
+  const barcode = String(formData.get("barcode") || "").trim();
+  const productNameSnapshot = String(
+    formData.get("productNameSnapshot") || "",
+  ).trim();
+  const categoryRuleId = String(formData.get("categoryRuleId") || "").trim();
+  const productScaleResult = parseDecimalInput(
+    String(formData.get("productScale") || ""),
+    "Product scale",
+  );
+  const isActive = formData.get("isActive") === "on";
+
+  const filters = {
+    lpId,
+    category,
+    activeStatus,
+    ruleId,
+  };
+
+  if (
+    !lpId ||
+    !barcode ||
+    isScientificNotationText(barcode) ||
+    !categoryRuleId ||
+    !productScaleResult.ok
+  ) {
+    redirect(
+      buildProductRulesHref({
+        ...filters,
+        mutation: "invalid",
+      }),
+    );
+  }
+
+  if (!session.user.id) {
+    redirect(
+      buildProductRulesHref({
+        ...filters,
+        mutation: "forbidden",
+      }),
+    );
+  }
+
+  const membership = await prisma.lpMembership.findFirst({
+    where: {
+      userId: session.user.id,
+      lpId,
+    },
+    select: {
+      role: true,
+    },
+  });
+
+  const canManageRules =
+    session.user.systemRole === "ADMIN" ||
+    (membership ? MANAGEABLE_LP_ROLES.includes(membership.role) : false);
+
+  if (!canManageRules) {
+    redirect(
+      buildProductRulesHref({
+        ...filters,
+        mutation: "forbidden",
+      }),
+    );
+  }
+
+  const categoryRule = await prisma.categoryRule.findFirst({
+    where: {
+      id: categoryRuleId,
+      lpId,
+      isActive: true,
+    },
+    select: {
+      id: true,
+    },
+  });
+
+  if (!categoryRule) {
+    redirect(
+      buildProductRulesHref({
+        ...filters,
+        mutation: "invalid",
+      }),
+    );
+  }
+
+  if (ruleId) {
+    const existingRule = await prisma.productScaleRule.findFirst({
+      where: {
+        id: ruleId,
+        lpId,
+      },
+      select: {
+        id: true,
+      },
+    });
+
+    if (!existingRule) {
+      redirect(
+        buildProductRulesHref({
+          ...filters,
+          mutation: "not_found",
+        }),
+      );
+    }
+  }
+
+  try {
+    if (ruleId) {
+      await prisma.productScaleRule.update({
+        where: {
+          id: ruleId,
+        },
+        data: {
+          barcode,
+          productNameSnapshot: productNameSnapshot || null,
+          categoryRuleId,
+          productScale: productScaleResult.value,
+          isActive,
+        },
+      });
+    }
+
+    const savedRule = ruleId
+      ? { id: ruleId }
+      : await prisma.productScaleRule.create({
+          data: {
+            lpId,
+            barcode,
+            productNameSnapshot: productNameSnapshot || null,
+            categoryRuleId,
+            productScale: productScaleResult.value,
+            isActive,
+          },
+          select: {
+            id: true,
+          },
+        });
+
+    revalidatePath("/lp/rules/products");
+
+    redirect(
+      buildProductRulesHref({
+        lpId,
+        category: "",
+        activeStatus,
+        ruleId: savedRule.id,
+        mutation: ruleId ? "updated" : "created",
+      }),
+    );
+  } catch (error) {
+    console.error("Failed to save product scale rule", error);
+
+    redirect(
+      buildProductRulesHref({
+        ...filters,
+        mutation: "error",
+      }),
+    );
+  }
 }
 
 async function toggleProductRuleStatus(formData: FormData) {
@@ -473,6 +682,7 @@ async function getLpProductRulesState(
       prisma.categoryRule.findMany({
         where: {
           lpId: currentMembership.lpId,
+          isActive: true,
         },
         orderBy: [{ categoryKey: "asc" }],
         select: {
@@ -915,23 +1125,78 @@ export default async function LpProductRulesPage({
                       including linked category rule context where available.
                     </CardDescription>
                   </div>
-                  <div className="rounded-2xl border border-cyan-400/20 bg-cyan-400/10 px-4 py-3 text-sm leading-6 text-cyan-100">
+                  <form
+                    action={saveProductRule}
+                    className="grid min-w-80 gap-3 rounded-2xl border border-cyan-400/20 bg-cyan-400/10 px-4 py-3 text-sm leading-6 text-cyan-100"
+                  >
+                    <input
+                      type="hidden"
+                      name="lpId"
+                      value={state.currentContext.lpId}
+                    />
+                    <input
+                      type="hidden"
+                      name="categoryFilter"
+                      value={state.filters.category}
+                    />
+                    <input
+                      type="hidden"
+                      name="activeStatusFilter"
+                      value={state.filters.activeStatus}
+                    />
                     <div className="font-medium text-white">Create rule</div>
-                    <div>
-                      TODO: wire the product-scale-rule creation flow once the
-                      LP-side mutation forms are implemented.
-                    </div>
-                    <div className="pt-3">
-                      <Button
-                        type="button"
-                        size="sm"
-                        disabled={!state.canManageRules}
-                        className="bg-white text-slate-950 hover:bg-slate-100 disabled:bg-white/20 disabled:text-slate-400"
+                    <input
+                      name="barcode"
+                      required
+                      placeholder="Barcode"
+                      className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
+                    />
+                    <input
+                      name="productNameSnapshot"
+                      placeholder="Product name"
+                      className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
+                    />
+                    <div className="grid gap-3 sm:grid-cols-[1.2fr_0.8fr]">
+                      <select
+                        name="categoryRuleId"
+                        required
+                        className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
                       >
-                        Create product rule
-                      </Button>
+                        <option value="">Choose category</option>
+                        {state.categoryOptions
+                          .filter((option) => option.id !== UNLINKED_CATEGORY_FILTER)
+                          .map((option) => (
+                            <option key={option.id} value={option.id}>
+                              {option.label}
+                            </option>
+                          ))}
+                      </select>
+                      <input
+                        name="productScale"
+                        required
+                        inputMode="decimal"
+                        placeholder="Scale"
+                        className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
+                      />
                     </div>
-                  </div>
+                    <label className="flex items-center gap-2 text-xs text-cyan-100">
+                      <input
+                        type="checkbox"
+                        name="isActive"
+                        defaultChecked
+                        className="size-4 accent-cyan-300"
+                      />
+                      Active
+                    </label>
+                    <Button
+                      type="submit"
+                      size="sm"
+                      disabled={!state.canManageRules}
+                      className="bg-white text-slate-950 hover:bg-slate-100 disabled:bg-white/20 disabled:text-slate-400"
+                    >
+                      Create product rule
+                    </Button>
+                  </form>
                 </div>
               </CardHeader>
               <CardContent>
@@ -994,13 +1259,22 @@ export default async function LpProductRulesPage({
                             <td className="px-4 py-4 text-sm">
                               <div className="flex flex-wrap gap-2">
                                 <Button
-                                  type="button"
+                                  asChild
                                   size="sm"
                                   variant="ghost"
-                                  disabled
-                                  className="text-slate-300 disabled:text-slate-500"
+                                  className="text-slate-300 hover:bg-white/5 hover:text-white"
                                 >
-                                  Edit rule
+                                  <Link
+                                    href={buildProductRulesHref({
+                                      lpId: state.currentContext.lpId,
+                                      category: state.filters.category,
+                                      activeStatus: state.filters.activeStatus,
+                                      ruleId: row.id,
+                                      mutation: undefined,
+                                    })}
+                                  >
+                                    Edit rule
+                                  </Link>
                                 </Button>
 
                                 <form action={toggleProductRuleStatus}>
@@ -1077,62 +1351,154 @@ export default async function LpProductRulesPage({
             </Card>
 
             {state.kind === "ready" && state.selectedRule ? (
-              <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
-                <CardHeader className="space-y-2">
-                  <CardTitle className="text-xl text-white">
-                    Product rule details
-                  </CardTitle>
-                  <CardDescription className="text-sm leading-6 text-slate-300">
-                    Review the selected product scale rule and linked category-rule
-                    context.
-                  </CardDescription>
-                </CardHeader>
-                <CardContent className="grid gap-3 lg:grid-cols-2">
-                  <DetailRow label="Rule ID" value={state.selectedRule.id} />
-                  <DetailRow label="Barcode" value={state.selectedRule.barcode} />
-                  <DetailRow
-                    label="Product name snapshot"
-                    value={state.selectedRule.productNameSnapshot ?? "Not captured"}
-                  />
-                  <DetailRow
-                    label="Product scale"
-                    value={state.selectedRule.productScale}
-                  />
-                  <DetailRow
-                    label="Status"
-                    value={
-                      <StatusBadge
-                        label={state.selectedRule.isActive ? "Active" : "Inactive"}
-                        className={getActiveTone(state.selectedRule.isActive)}
+              <div className="grid gap-4 xl:grid-cols-[1fr_0.9fr]">
+                <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
+                  <CardHeader className="space-y-2">
+                    <CardTitle className="text-xl text-white">
+                      Product rule details
+                    </CardTitle>
+                    <CardDescription className="text-sm leading-6 text-slate-300">
+                      Review the selected product scale rule and linked
+                      category-rule context.
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className="grid gap-3">
+                    <DetailRow label="Rule ID" value={state.selectedRule.id} />
+                    <DetailRow label="Barcode" value={state.selectedRule.barcode} />
+                    <DetailRow
+                      label="Product name snapshot"
+                      value={
+                        state.selectedRule.productNameSnapshot ?? "Not captured"
+                      }
+                    />
+                    <DetailRow
+                      label="Product scale"
+                      value={state.selectedRule.productScale}
+                    />
+                    <DetailRow
+                      label="Status"
+                      value={
+                        <StatusBadge
+                          label={
+                            state.selectedRule.isActive ? "Active" : "Inactive"
+                          }
+                          className={getActiveTone(state.selectedRule.isActive)}
+                        />
+                      }
+                    />
+                    <DetailRow
+                      label="Category"
+                      value={
+                        state.selectedRule.categoryDisplayName
+                          ? `${state.selectedRule.categoryDisplayName} · ${state.selectedRule.categoryKey}`
+                          : state.selectedRule.categoryKey ?? "Unlinked"
+                      }
+                    />
+                    <DetailRow
+                      label="Effective from"
+                      value={formatDate(state.selectedRule.effectiveFrom)}
+                    />
+                    <DetailRow
+                      label="Effective to"
+                      value={formatDate(state.selectedRule.effectiveTo)}
+                    />
+                    <DetailRow
+                      label="Created at"
+                      value={formatDateTime(state.selectedRule.createdAt)}
+                    />
+                    <DetailRow
+                      label="Updated at"
+                      value={formatDateTime(state.selectedRule.updatedAt)}
+                    />
+                  </CardContent>
+                </Card>
+
+                <Card className="border border-white/10 bg-white/6 shadow-2xl backdrop-blur-xl">
+                  <CardHeader className="space-y-2">
+                    <CardTitle className="text-xl text-white">
+                      Edit product rule
+                    </CardTitle>
+                    <CardDescription className="text-sm leading-6 text-slate-300">
+                      Update barcode, category link, scale, and activation.
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    <form action={saveProductRule} className="grid gap-3">
+                      <input
+                        type="hidden"
+                        name="lpId"
+                        value={state.currentContext.lpId}
                       />
-                    }
-                  />
-                  <DetailRow
-                    label="Category"
-                    value={
-                      state.selectedRule.categoryDisplayName
-                        ? `${state.selectedRule.categoryDisplayName} · ${state.selectedRule.categoryKey}`
-                        : state.selectedRule.categoryKey ?? "Unlinked"
-                    }
-                  />
-                  <DetailRow
-                    label="Effective from"
-                    value={formatDate(state.selectedRule.effectiveFrom)}
-                  />
-                  <DetailRow
-                    label="Effective to"
-                    value={formatDate(state.selectedRule.effectiveTo)}
-                  />
-                  <DetailRow
-                    label="Created at"
-                    value={formatDateTime(state.selectedRule.createdAt)}
-                  />
-                  <DetailRow
-                    label="Updated at"
-                    value={formatDateTime(state.selectedRule.updatedAt)}
-                  />
-                </CardContent>
-              </Card>
+                      <input
+                        type="hidden"
+                        name="ruleId"
+                        value={state.selectedRule.id}
+                      />
+                      <input
+                        type="hidden"
+                        name="categoryFilter"
+                        value={state.filters.category}
+                      />
+                      <input
+                        type="hidden"
+                        name="activeStatusFilter"
+                        value={state.filters.activeStatus}
+                      />
+                      <input
+                        name="barcode"
+                        required
+                        defaultValue={state.selectedRule.barcode}
+                        className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
+                      />
+                      <input
+                        name="productNameSnapshot"
+                        defaultValue={
+                          state.selectedRule.productNameSnapshot ?? ""
+                        }
+                        className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
+                      />
+                      <select
+                        name="categoryRuleId"
+                        required
+                        defaultValue={state.selectedRule.categoryRuleId ?? ""}
+                        className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
+                      >
+                        <option value="">Choose category</option>
+                        {state.categoryOptions
+                          .filter((option) => option.id !== UNLINKED_CATEGORY_FILTER)
+                          .map((option) => (
+                            <option key={option.id} value={option.id}>
+                              {option.label}
+                            </option>
+                          ))}
+                      </select>
+                      <input
+                        name="productScale"
+                        required
+                        inputMode="decimal"
+                        defaultValue={state.selectedRule.productScale}
+                        className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
+                      />
+                      <label className="flex items-center gap-2 text-xs text-slate-300">
+                        <input
+                          type="checkbox"
+                          name="isActive"
+                          defaultChecked={state.selectedRule.isActive}
+                          className="size-4 accent-cyan-300"
+                        />
+                        Active
+                      </label>
+                      <Button
+                        type="submit"
+                        disabled={!state.canManageRules}
+                        className="w-full bg-cyan-400 text-slate-950 hover:bg-cyan-300 disabled:bg-white/20 disabled:text-slate-400"
+                      >
+                        Save product rule
+                      </Button>
+                    </form>
+                  </CardContent>
+                </Card>
+              </div>
             ) : null}
           </div>
         ) : null}

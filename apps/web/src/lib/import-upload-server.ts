@@ -421,19 +421,6 @@ export async function finalizeImportUpload(args: {
       },
     });
 
-    if (payload.sourceType !== "LP") {
-      await tx.importBatch.updateMany({
-        where: {
-          cycleId: cycle.id,
-          sourceType: payload.sourceType,
-          isCurrent: true,
-        },
-        data: {
-          isCurrent: false,
-        },
-      });
-    }
-
     const uploadedFile = await tx.uploadedFile.create({
       data: {
         fileKind: getFileKindForSourceType(payload.sourceType),
@@ -455,7 +442,7 @@ export async function finalizeImportUpload(args: {
         uploadedFileId: uploadedFile.id,
         sourceType: payload.sourceType,
         status: "RECEIVED",
-        isCurrent: payload.sourceType !== "LP",
+        isCurrent: false,
         uploadedByUserId: args.actor.userId,
       },
       select: {

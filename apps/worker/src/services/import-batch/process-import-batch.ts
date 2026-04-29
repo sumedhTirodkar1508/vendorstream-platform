@@ -114,7 +114,7 @@ export async function processImportBatch(
     if (parsedWorkbook.kind === "prevalidation-failure") {
       const errorMessage = parsedWorkbook.errors.join(" ");
 
-      if (batch.sourceType === "LP") {
+      if (batch.sourceType === "LP" || batch.sourceType === "STORE") {
         await repository.markBatchPrevalidationFailed(
           batch.id,
           batch.cycleId,
@@ -184,6 +184,37 @@ export async function processImportBatch(
       };
     }
 
+    if (
+      parsedWorkbook.sourceType === "STORE" &&
+      parsedWorkbook.invalidRowCount > 0
+    ) {
+      const errorMessage =
+        "Store workbook validation failed. Fix the row-level errors and upload the workbook again.";
+
+      await repository.persistStoreWorkbookValidationFailure(
+        batch.id,
+        batch.cycleId,
+        parsedWorkbook,
+        errorMessage,
+      );
+      await repository.synchronizeCycleState(batch.cycleId);
+
+      logger.warn(
+        {
+          importBatchId: batch.id,
+          cycleId: batch.cycleId,
+          sourceType: batch.sourceType,
+          totalRowCount: parsedWorkbook.totalRowCount,
+          invalidRowCount: parsedWorkbook.invalidRowCount,
+        },
+        "Store import batch failed row validation",
+      );
+
+      return {
+        reconcileCyclePayload: null,
+      };
+    }
+
     if (parsedWorkbook.validRowCount === 0) {
       const errorMessage =
         "Workbook parsed successfully but no valid rows were found for staging.";
@@ -213,17 +244,13 @@ export async function processImportBatch(
         };
       }
 
-      await repository.markBatchValidationFailed(
+      await repository.persistStoreWorkbookValidationFailure(
         batch.id,
         batch.cycleId,
-        parsedWorkbook.validationSummary,
+        parsedWorkbook,
         errorMessage,
-        {
-          totalRowCount: parsedWorkbook.totalRowCount,
-          validRowCount: parsedWorkbook.validRowCount,
-          invalidRowCount: parsedWorkbook.invalidRowCount,
-        },
       );
+      await repository.synchronizeCycleState(batch.cycleId);
 
       logger.warn(
         {
@@ -255,7 +282,7 @@ export async function processImportBatch(
       );
     }
 
-    await repository.synchronizeCycleState(batch.cycleId);
+    const cycleStatus = await repository.synchronizeCycleState(batch.cycleId);
 
     logger.info(
       {
@@ -270,7 +297,15 @@ export async function processImportBatch(
     );
 
     return {
-      reconcileCyclePayload: null,
+      reconcileCyclePayload:
+        cycleStatus === "READY_FOR_RECONCILIATION"
+          ? {
+              cycleId: batch.cycleId,
+              lpId: batch.cycle.lpId,
+              storeLocationId: batch.cycle.storeLocationId,
+              periodMonth: payload.periodMonth,
+            }
+          : null,
     };
   } catch (error) {
     const errorMessage =

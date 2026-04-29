@@ -109,6 +109,13 @@ export class ImportBatchRepository {
           failedAt: null,
         },
       });
+      const batch = await tx.importBatch.findUnique({
+        where: { id: importBatchId },
+        select: {
+          sourceType: true,
+          uploadedFileId: true,
+        },
+      });
       await recordAuditLog(tx, {
         actorType: "SYSTEM",
         action: "import_batch.validation.started",
@@ -116,6 +123,12 @@ export class ImportBatchRepository {
         entityId: importBatchId,
         cycleId,
         batchId: importBatchId,
+        metadata: batch
+          ? {
+              sourceType: batch.sourceType,
+              uploadedFileId: batch.uploadedFileId,
+            }
+          : undefined,
       });
       await tx.reconciliationCycle.update({
         where: { id: cycleId },
@@ -141,6 +154,13 @@ export class ImportBatchRepository {
     const updateCycleFailure = options?.updateCycleFailure ?? true;
 
     await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      const batch = await tx.importBatch.findUnique({
+        where: { id: importBatchId },
+        select: {
+          sourceType: true,
+          uploadedFileId: true,
+        },
+      });
       await tx.importBatch.update({
         where: { id: importBatchId },
         data: {
@@ -176,6 +196,8 @@ export class ImportBatchRepository {
         cycleId,
         batchId: importBatchId,
         metadata: {
+          sourceType: batch?.sourceType,
+          uploadedFileId: batch?.uploadedFileId,
           errorMessage,
           ...details,
         },
@@ -371,7 +393,10 @@ export class ImportBatchRepository {
         entityId: importBatchId,
         cycleId,
         batchId: importBatchId,
-        metadata: parsedWorkbook.validationSummary,
+        metadata: {
+          sourceType: "LP",
+          ...parsedWorkbook.validationSummary,
+        },
       });
 
       await recordAuditLog(tx, {
@@ -381,6 +406,9 @@ export class ImportBatchRepository {
         entityId: importBatchId,
         cycleId,
         batchId: importBatchId,
+        metadata: {
+          sourceType: "LP",
+        },
       });
     });
   }
@@ -431,10 +459,25 @@ export class ImportBatchRepository {
         });
       });
 
+      await tx.importBatch.updateMany({
+        where: {
+          cycleId,
+          sourceType: "STORE",
+          isCurrent: true,
+          id: {
+            not: importBatchId,
+          },
+        },
+        data: {
+          isCurrent: false,
+        },
+      });
+
       await tx.importBatch.update({
         where: { id: importBatchId },
         data: {
           status: "STAGED",
+          isCurrent: true,
           totalRowCount: parsedWorkbook.totalRowCount,
           validRowCount: parsedWorkbook.validRowCount,
           invalidRowCount: parsedWorkbook.invalidRowCount,
@@ -442,6 +485,87 @@ export class ImportBatchRepository {
           validationSummary: parsedWorkbook.validationSummary,
           processedAt: now,
           failedAt: null,
+        },
+      });
+
+      await recordAuditLog(tx, {
+        actorType: "SYSTEM",
+        action: "import_batch.validation_passed",
+        entityType: "IMPORT_BATCH",
+        entityId: importBatchId,
+        cycleId,
+        batchId: importBatchId,
+        metadata: {
+          sourceType: "STORE",
+          ...parsedWorkbook.validationSummary,
+        },
+      });
+
+      await recordAuditLog(tx, {
+        actorType: "SYSTEM",
+        action: "import_batch.promoted_current",
+        entityType: "IMPORT_BATCH",
+        entityId: importBatchId,
+        cycleId,
+        batchId: importBatchId,
+        metadata: {
+          sourceType: "STORE",
+        },
+      });
+    });
+  }
+
+  async persistStoreWorkbookValidationFailure(
+    importBatchId: string,
+    cycleId: string,
+    parsedWorkbook: ParsedStoreWorkbook,
+    errorMessage: string,
+  ): Promise<void> {
+    const now = new Date();
+
+    await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      await createManyInChunks(parsedWorkbook.rawRows, async (chunk) => {
+        await tx.rawStoreRow.createMany({
+          data: chunk.map((row) => ({
+            id: row.id,
+            importBatchId,
+            sourceRowNumber: row.sourceRowNumber,
+            parseStatus: row.parseErrors ? "FAILED" : "PARSED",
+            rawData: row.rawData,
+            parseErrors: row.parseErrors ?? undefined,
+          })),
+        });
+      });
+
+      await tx.importBatch.update({
+        where: { id: importBatchId },
+        data: {
+          status: "VALIDATION_FAILED",
+          isCurrent: false,
+          totalRowCount: parsedWorkbook.totalRowCount,
+          validRowCount: parsedWorkbook.validRowCount,
+          invalidRowCount: parsedWorkbook.invalidRowCount,
+          preValidationErrors: Prisma.DbNull,
+          validationSummary: {
+            ...parsedWorkbook.validationSummary,
+            errorMessage,
+          },
+          processedAt: null,
+          failedAt: now,
+        },
+      });
+
+      await recordAuditLog(tx, {
+        actorType: "SYSTEM",
+        action: "import_batch.validation_failed",
+        entityType: "IMPORT_BATCH",
+        entityId: importBatchId,
+        cycleId,
+        batchId: importBatchId,
+        metadata: {
+          sourceType: "STORE",
+          errorMessage,
+          ...parsedWorkbook.validationSummary,
         },
       });
     });
@@ -605,13 +729,15 @@ export class ImportBatchRepository {
     return targetCycleStatus;
   }
 
-  async findFailedLpBatchesForRetentionCleanup(args: {
+  async findFailedBatchesForRetentionCleanup(args: {
     cutoff: Date;
     take: number;
   }) {
     return prisma.importBatch.findMany({
       where: {
-        sourceType: "LP",
+        sourceType: {
+          in: ["LP", "STORE"],
+        },
         status: {
           in: ["PREVALIDATION_FAILED", "VALIDATION_FAILED", "FAILED"],
         },
@@ -634,6 +760,16 @@ export class ImportBatchRepository {
               some: {},
             },
           },
+          {
+            rawStoreRows: {
+              some: {},
+            },
+          },
+          {
+            normalizedStoreRows: {
+              some: {},
+            },
+          },
         ],
       },
       orderBy: {
@@ -642,6 +778,7 @@ export class ImportBatchRepository {
       take: args.take,
       select: {
         id: true,
+        sourceType: true,
         uploadedFileId: true,
         uploadedFile: {
           select: {
@@ -655,23 +792,38 @@ export class ImportBatchRepository {
     });
   }
 
-  async markFailedLpBatchArtifactsCleaned(args: {
+  async markFailedBatchArtifactsCleaned(args: {
     importBatchId: string;
     uploadedFileId: string;
+    sourceType: $Enums.BatchSourceType;
     deletedAt: Date;
   }): Promise<void> {
     await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-      await tx.normalizedLpRow.deleteMany({
-        where: {
-          importBatchId: args.importBatchId,
-        },
-      });
+      if (args.sourceType === "LP") {
+        await tx.normalizedLpRow.deleteMany({
+          where: {
+            importBatchId: args.importBatchId,
+          },
+        });
 
-      await tx.rawLpRow.deleteMany({
-        where: {
-          importBatchId: args.importBatchId,
-        },
-      });
+        await tx.rawLpRow.deleteMany({
+          where: {
+            importBatchId: args.importBatchId,
+          },
+        });
+      } else {
+        await tx.normalizedStoreRow.deleteMany({
+          where: {
+            importBatchId: args.importBatchId,
+          },
+        });
+
+        await tx.rawStoreRow.deleteMany({
+          where: {
+            importBatchId: args.importBatchId,
+          },
+        });
+      }
 
       await tx.uploadedFile.update({
         where: {
@@ -689,6 +841,7 @@ export class ImportBatchRepository {
         entityId: args.importBatchId,
         batchId: args.importBatchId,
         metadata: {
+          sourceType: args.sourceType,
           uploadedFileId: args.uploadedFileId,
           cleanedAt: args.deletedAt.toISOString(),
         },

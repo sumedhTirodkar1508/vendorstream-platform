@@ -9,6 +9,7 @@ import {
   type ProcessImportBatchPayload,
   type ReconcileCyclePayload,
 } from "@vendorstream/contracts";
+import { prisma, recordAuditLog } from "@vendorstream/database";
 
 import { createSupabaseStorageAdapter } from "./adapters/supabase-storage.js";
 import { getQueueConfig } from "./config.js";
@@ -44,6 +45,20 @@ async function enqueueReconcileCycleJob(
     },
     "Enqueued reconcile-cycle job",
   );
+
+  await recordAuditLog(prisma, {
+    actorType: "SYSTEM",
+    action: "reconciliation.enqueued",
+    entityType: "RECONCILIATION_CYCLE",
+    entityId: payload.cycleId,
+    cycleId: payload.cycleId,
+    metadata: {
+      jobId,
+      lpId: payload.lpId,
+      storeLocationId: payload.storeLocationId,
+      periodMonth: payload.periodMonth,
+    },
+  });
 }
 
 async function enqueueGenerateStatementJob(
@@ -232,7 +247,7 @@ export async function startWorker(): Promise<void> {
         storageAdapter,
       });
 
-      logger.info(outcome, "Finished failed LP upload artifact cleanup");
+      logger.info(outcome, "Finished failed import upload artifact cleanup");
     },
   );
 

@@ -27,7 +27,7 @@ export async function cleanupFailedUploadArtifacts(
 ): Promise<CleanupFailedUploadArtifactsOutcome> {
   const { repository, storageAdapter } = dependencies;
   const cutoff = getRetentionCutoff();
-  const batches = await repository.findFailedLpBatchesForRetentionCleanup({
+  const batches = await repository.findFailedBatchesForRetentionCleanup({
     cutoff,
     take: CLEANUP_BATCH_SIZE,
   });
@@ -43,9 +43,10 @@ export async function cleanupFailedUploadArtifacts(
         );
       }
 
-      await repository.markFailedLpBatchArtifactsCleaned({
+      await repository.markFailedBatchArtifactsCleaned({
         importBatchId: batch.id,
         uploadedFileId: batch.uploadedFileId,
+        sourceType: batch.sourceType,
         deletedAt: new Date(),
       });
 
@@ -57,8 +58,9 @@ export async function cleanupFailedUploadArtifacts(
           err: error,
           importBatchId: batch.id,
           uploadedFileId: batch.uploadedFileId,
+          sourceType: batch.sourceType,
         },
-        "Failed to clean retained LP upload artifacts",
+        "Failed to clean retained import upload artifacts",
       );
     }
   }

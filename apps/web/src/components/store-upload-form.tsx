@@ -248,7 +248,7 @@ export function StoreUploadForm({
         type: "success",
         text:
           payload.message ||
-          `Store upload completed for ${formatMonthLabel(month)}.`,
+          `Store upload queued for validation for ${formatMonthLabel(month)}.`,
       });
     } catch (error) {
       setUploadProgress(0);

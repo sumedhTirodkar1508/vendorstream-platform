@@ -1009,6 +1009,22 @@ export default async function StoreUploadsPage({
                     label="Rows"
                     value={`${state.selectedBatch.totalRows ?? "N/A"} total · ${state.selectedBatch.validRows ?? "N/A"} valid · ${state.selectedBatch.invalidRows ?? "N/A"} invalid`}
                   />
+                  {state.selectedBatch.status === "PREVALIDATION_FAILED" ||
+                  state.selectedBatch.status === "VALIDATION_FAILED" ? (
+                    <div className="lg:col-span-2">
+                      <Button
+                        asChild
+                        variant="outline"
+                        className="border-red-200/25 bg-white/5 text-white hover:bg-white/10"
+                      >
+                        <Link
+                          href={`/api/store/uploads/${state.selectedBatch.id}/validation-errors`}
+                        >
+                          Download validation errors CSV
+                        </Link>
+                      </Button>
+                    </div>
+                  ) : null}
                 </CardContent>
               </Card>
             ) : null}

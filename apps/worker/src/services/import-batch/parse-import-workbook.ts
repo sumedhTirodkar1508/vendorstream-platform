@@ -159,6 +159,10 @@ function getPeriodMonth(date: Date): string {
   return date.toISOString().slice(0, 7);
 }
 
+function isScientificNotationText(value: string): boolean {
+  return /^[+-]?\d+(?:\.\d+)?e[+-]?\d+$/i.test(value.trim());
+}
+
 function getRequiredString(
   rowData: Record<string, unknown>,
   fieldName: string,
@@ -451,6 +455,7 @@ function buildLpResult(
 function buildStoreResult(
   extractedWorksheet: ExtractedWorksheet,
   payload: ProcessImportBatchPayload,
+  validationContext: ParseWorkbookArgs["validationContext"],
 ): ParsedStoreWorkbook {
   const rawRows: ParsedStoreWorkbook["rawRows"] = [];
   const normalizedRows: ParsedStoreWorkbook["normalizedRows"] = [];
@@ -480,6 +485,44 @@ function buildStoreResult(
     }
 
     const parsedRow = parsed.data;
+    const businessErrors: string[] = [];
+
+    if (typeof dataRow.rowData["Barcode/UPC"] !== "string") {
+      businessErrors.push("Barcode/UPC must be stored as text in the workbook.");
+    } else if (isScientificNotationText(dataRow.rowData["Barcode/UPC"])) {
+      businessErrors.push(
+        "Barcode/UPC must be the full text barcode, not scientific notation.",
+      );
+    }
+
+    const supplierLp = getRequiredString(dataRow.rowData, "Supplier/LP");
+    if (
+      normalizeComparableText(supplierLp) !==
+      normalizeComparableText(validationContext.lpLegalName)
+    ) {
+      businessErrors.push(
+        "Supplier/LP does not match the selected LP legal name.",
+      );
+    }
+
+    if (businessErrors.length > 0) {
+      rawRows.push({
+        id: rowId,
+        sourceRowNumber: dataRow.rowNumber,
+        rawData: toJsonValue(dataRow.rowData),
+        parseErrors: businessErrors,
+      });
+
+      if (invalidRowsSample.length < 10) {
+        invalidRowsSample.push({
+          rowNumber: dataRow.rowNumber,
+          errors: businessErrors,
+        });
+      }
+
+      continue;
+    }
+
     rawRows.push({
       id: rowId,
       sourceRowNumber: dataRow.rowNumber,
@@ -487,15 +530,12 @@ function buildStoreResult(
     });
 
     const canonicalBarcode = normalizeBarcode(parsedRow["Barcode/UPC"]);
-    const primaryUnitPrice =
-      parsedRow["Sales Units"] > 0
-        ? parsedRow["Sales ($)"] / parsedRow["Sales Units"]
-        : null;
+    const primaryUnitPrice = parsedRow["Sales ($)"] / parsedRow["Sales Units"];
     const fallbackUnitPrice =
       typeof parsedRow["OCS.ca Sales Price ($) Exclude Tax"] === "number"
         ? parsedRow["OCS.ca Sales Price ($) Exclude Tax"] / 1.39
         : null;
-    const finalUnitPrice = primaryUnitPrice ?? fallbackUnitPrice;
+    const finalUnitPrice = primaryUnitPrice;
 
     const normalizedData = {
       subCategory: parsedRow.SubCategory ?? null,
@@ -525,8 +565,7 @@ function buildStoreResult(
       unitPricePrimary: primaryUnitPrice,
       unitPriceFallback: fallbackUnitPrice,
       finalUnitPrice,
-      usedFallbackPrice:
-        primaryUnitPrice === null && fallbackUnitPrice !== null,
+      usedFallbackPrice: false,
       rowFingerprint: computeRowFingerprint([
         payload.cycleId,
         dataRow.rowNumber,
@@ -601,5 +640,5 @@ export async function parseImportWorkbook({
     return buildLpResult(extractedWorksheet, payload, validationContext);
   }
 
-  return buildStoreResult(extractedWorksheet, payload);
+  return buildStoreResult(extractedWorksheet, payload, validationContext);
 }

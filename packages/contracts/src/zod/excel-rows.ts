@@ -73,16 +73,22 @@ export const LpExcelRowSchema = z.object({
 // STORE MONTHLY SALES ROW SCHEMA
 // ==========================================
 export const StoreExcelRowSchema = z.object({
-  SubCategory: z.coerce.string().optional(),
+  SubCategory: z.coerce.string().min(1, "SubCategory is required."),
   SubSubCategory: z.coerce.string().optional(),
-  "Supplier/LP": z.coerce.string().optional(),
+  "Supplier/LP": z.coerce.string().min(1, "Supplier/LP is required."),
   Brand: z.coerce.string().optional(),
-  "Item Name": z.coerce.string().optional(),
+  "Item Name": z.coerce.string().min(1, "Item Name is required."),
   SKU: z.coerce.string().optional(), // Fallback
 
   // Rule 8.1: Primary Price Formula values
-  "Sales ($)": z.preprocess(numericPreprocessor, z.number()),
-  "Sales Units": z.preprocess(numericPreprocessor, z.number().min(0)),
+  "Sales ($)": z.preprocess(
+    numericPreprocessor,
+    z.number().min(1, "Sales ($) must be greater than 0"),
+  ),
+  "Sales Units": z.preprocess(
+    numericPreprocessor,
+    z.number().min(1, "Sales Units must be greater than 0"),
+  ),
 
   // Rule 8.2: Backup Price Formula value
   "OCS.ca Sales Price ($) Exclude Tax": z.preprocess(

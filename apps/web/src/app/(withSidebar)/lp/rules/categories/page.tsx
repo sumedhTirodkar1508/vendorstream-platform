@@ -234,6 +234,20 @@ function getMutationBanner(mutation: string) {
     };
   }
 
+  if (mutation === "created") {
+    return {
+      tone: "success" as const,
+      message: "Category rule created successfully.",
+    };
+  }
+
+  if (mutation === "updated") {
+    return {
+      tone: "success" as const,
+      message: "Category rule updated successfully.",
+    };
+  }
+
   if (mutation === "invalid") {
     return {
       tone: "warning" as const,
@@ -263,6 +277,171 @@ function getMutationBanner(mutation: string) {
   }
 
   return null;
+}
+
+function parseDecimalInput(value: string, fieldName: string) {
+  const trimmed = value.trim();
+  const parsed = Number(trimmed);
+
+  if (!trimmed || !Number.isFinite(parsed) || parsed <= 0) {
+    return {
+      ok: false as const,
+      error: `${fieldName} must be greater than 0.`,
+    };
+  }
+
+  return {
+    ok: true as const,
+    value: parsed.toFixed(4),
+  };
+}
+
+async function saveCategoryRule(formData: FormData) {
+  "use server";
+
+  const session = await getServerSession(authOptions);
+
+  if (!session?.user) {
+    redirect("/login");
+  }
+
+  const lpId = String(formData.get("lpId") || "").trim();
+  const ruleId = String(formData.get("ruleId") || "").trim();
+  const categoryKey = String(formData.get("categoryKey") || "").trim();
+  const displayName = String(formData.get("displayName") || "").trim();
+  const maxScaleResult = parseDecimalInput(
+    String(formData.get("maxScale") || ""),
+    "Max scale",
+  );
+  const maxCommissionPercentResult = parseDecimalInput(
+    String(formData.get("maxCommissionPercent") || ""),
+    "Max commission percent",
+  );
+  const isActive = formData.get("isActive") === "on";
+
+  const filters = {
+    lpId,
+    ruleId,
+  };
+
+  if (
+    !lpId ||
+    !categoryKey ||
+    !maxScaleResult.ok ||
+    !maxCommissionPercentResult.ok
+  ) {
+    redirect(
+      buildCategoryRulesHref({
+        ...filters,
+        mutation: "invalid",
+      }),
+    );
+  }
+
+  if (!session.user.id) {
+    redirect(
+      buildCategoryRulesHref({
+        ...filters,
+        mutation: "forbidden",
+      }),
+    );
+  }
+
+  const membership = await prisma.lpMembership.findFirst({
+    where: {
+      userId: session.user.id,
+      lpId,
+    },
+    select: {
+      role: true,
+    },
+  });
+
+  const canManageRules =
+    session.user.systemRole === "ADMIN" ||
+    (membership ? MANAGEABLE_LP_ROLES.includes(membership.role) : false);
+
+  if (!canManageRules) {
+    redirect(
+      buildCategoryRulesHref({
+        ...filters,
+        mutation: "forbidden",
+      }),
+    );
+  }
+
+  if (ruleId) {
+    const existingRule = await prisma.categoryRule.findFirst({
+      where: {
+        id: ruleId,
+        lpId,
+      },
+      select: {
+        id: true,
+      },
+    });
+
+    if (!existingRule) {
+      redirect(
+        buildCategoryRulesHref({
+          ...filters,
+          mutation: "not_found",
+        }),
+      );
+    }
+  }
+
+  try {
+    if (ruleId) {
+      await prisma.categoryRule.update({
+        where: {
+          id: ruleId,
+        },
+        data: {
+          categoryKey,
+          displayName: displayName || null,
+          maxScale: maxScaleResult.value,
+          maxCommissionPercent: maxCommissionPercentResult.value,
+          isActive,
+        },
+      });
+    }
+
+    const savedRule = ruleId
+      ? { id: ruleId }
+      : await prisma.categoryRule.create({
+          data: {
+            lpId,
+            categoryKey,
+            displayName: displayName || null,
+            maxScale: maxScaleResult.value,
+            maxCommissionPercent: maxCommissionPercentResult.value,
+            isActive,
+          },
+          select: {
+            id: true,
+          },
+        });
+
+    revalidatePath("/lp/rules/categories");
+
+    redirect(
+      buildCategoryRulesHref({
+        lpId,
+        ruleId: savedRule.id,
+        mutation: ruleId ? "updated" : "created",
+      }),
+    );
+  } catch (error) {
+    console.error("Failed to save category rule", error);
+
+    redirect(
+      buildCategoryRulesHref({
+        ...filters,
+        mutation: "error",
+      }),
+    );
+  }
 }
 
 async function toggleCategoryRuleStatus(formData: FormData) {
@@ -817,23 +996,61 @@ export default async function LpCategoryRulesPage({
                       Real `CategoryRule` records for the active LP workspace.
                     </CardDescription>
                   </div>
-                  <div className="rounded-2xl border border-cyan-400/20 bg-cyan-400/10 px-4 py-3 text-sm leading-6 text-cyan-100">
+                  <form
+                    action={saveCategoryRule}
+                    className="grid min-w-72 gap-3 rounded-2xl border border-cyan-400/20 bg-cyan-400/10 px-4 py-3 text-sm leading-6 text-cyan-100"
+                  >
+                    <input
+                      type="hidden"
+                      name="lpId"
+                      value={state.currentContext.lpId}
+                    />
                     <div className="font-medium text-white">Create rule</div>
-                    <div>
-                      TODO: wire the category-rule creation flow once the LP-side
-                      rule mutation forms are implemented.
+                    <input
+                      name="categoryKey"
+                      required
+                      placeholder="Category key"
+                      className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
+                    />
+                    <input
+                      name="displayName"
+                      placeholder="Display name"
+                      className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
+                    />
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <input
+                        name="maxScale"
+                        required
+                        inputMode="decimal"
+                        placeholder="Max scale"
+                        className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
+                      />
+                      <input
+                        name="maxCommissionPercent"
+                        required
+                        inputMode="decimal"
+                        placeholder="Max commission %"
+                        className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
+                      />
                     </div>
-                    <div className="pt-3">
-                      <Button
-                        type="button"
-                        size="sm"
-                        disabled={!state.canManageRules}
-                        className="bg-white text-slate-950 hover:bg-slate-100 disabled:bg-white/20 disabled:text-slate-400"
-                      >
-                        Create category rule
-                      </Button>
-                    </div>
-                  </div>
+                    <label className="flex items-center gap-2 text-xs text-cyan-100">
+                      <input
+                        type="checkbox"
+                        name="isActive"
+                        defaultChecked
+                        className="size-4 accent-cyan-300"
+                      />
+                      Active
+                    </label>
+                    <Button
+                      type="submit"
+                      size="sm"
+                      disabled={!state.canManageRules}
+                      className="bg-white text-slate-950 hover:bg-slate-100 disabled:bg-white/20 disabled:text-slate-400"
+                    >
+                      Create category rule
+                    </Button>
+                  </form>
                 </div>
               </CardHeader>
               <CardContent>
@@ -894,13 +1111,20 @@ export default async function LpCategoryRulesPage({
                             <td className="px-4 py-4 text-sm">
                               <div className="flex flex-wrap gap-2">
                                 <Button
-                                  type="button"
+                                  asChild
                                   size="sm"
                                   variant="ghost"
-                                  disabled
-                                  className="text-slate-300 disabled:text-slate-500"
+                                  className="text-slate-300 hover:bg-white/5 hover:text-white"
                                 >
-                                  Edit rule
+                                  <Link
+                                    href={buildCategoryRulesHref({
+                                      lpId: state.currentContext.lpId,
+                                      ruleId: row.id,
+                                      mutation: undefined,
+                                    })}
+                                  >
+                                    Edit rule
+                                  </Link>
                                 </Button>
 
                                 <form action={toggleCategoryRuleStatus}>
@@ -1069,11 +1293,66 @@ export default async function LpCategoryRulesPage({
                         Rule actions
                       </CardTitle>
                       <CardDescription className="text-sm leading-6 text-slate-300">
-                        Activation is available now. Create and edit flows can be
-                        connected when LP-side rule mutations are implemented.
+                        Update the selected category rule for this LP workspace.
                       </CardDescription>
                     </CardHeader>
-                    <CardContent className="space-y-3">
+                    <CardContent className="space-y-4">
+                      <form action={saveCategoryRule} className="grid gap-3">
+                        <input
+                          type="hidden"
+                          name="lpId"
+                          value={state.currentContext.lpId}
+                        />
+                        <input
+                          type="hidden"
+                          name="ruleId"
+                          value={state.selectedRule.id}
+                        />
+                        <input
+                          name="categoryKey"
+                          required
+                          defaultValue={state.selectedRule.categoryKey}
+                          className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
+                        />
+                        <input
+                          name="displayName"
+                          defaultValue={state.selectedRule.displayName ?? ""}
+                          className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
+                        />
+                        <div className="grid gap-3 sm:grid-cols-2">
+                          <input
+                            name="maxScale"
+                            required
+                            inputMode="decimal"
+                            defaultValue={state.selectedRule.maxScale}
+                            className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
+                          />
+                          <input
+                            name="maxCommissionPercent"
+                            required
+                            inputMode="decimal"
+                            defaultValue={state.selectedRule.maxCommissionPercent}
+                            className="h-10 rounded-md border border-white/10 bg-slate-950/70 px-3 text-sm text-white outline-none focus:border-cyan-300/40"
+                          />
+                        </div>
+                        <label className="flex items-center gap-2 text-xs text-slate-300">
+                          <input
+                            type="checkbox"
+                            name="isActive"
+                            defaultChecked={state.selectedRule.isActive}
+                            className="size-4 accent-cyan-300"
+                          />
+                          Active
+                        </label>
+                        <Button
+                          type="submit"
+                          disabled={!state.canManageRules}
+                          className="w-full bg-cyan-400 text-slate-950 hover:bg-cyan-300 disabled:bg-white/20 disabled:text-slate-400"
+                        >
+                          Save category rule
+                        </Button>
+                      </form>
+
                       <form action={toggleCategoryRuleStatus}>
                         <input
                           type="hidden"
@@ -1101,29 +1380,6 @@ export default async function LpCategoryRulesPage({
                             : "Activate category rule"}
                         </Button>
                       </form>
-
-                      <Button
-                        type="button"
-                        variant="outline"
-                        disabled
-                        className="w-full border-white/15 bg-white/5 text-white disabled:text-slate-500"
-                      >
-                        Edit rule
-                      </Button>
-
-                      <Button
-                        type="button"
-                        variant="outline"
-                        disabled
-                        className="w-full border-white/15 bg-white/5 text-white disabled:text-slate-500"
-                      >
-                        Create category rule
-                      </Button>
-
-                      <div className="rounded-2xl border border-cyan-400/20 bg-cyan-400/10 px-4 py-4 text-sm leading-6 text-cyan-100">
-                        TODO: connect create-rule and edit-rule flows once the
-                        corresponding LP-side mutation routes are implemented.
-                      </div>
                     </CardContent>
                   </Card>
                 </div>
