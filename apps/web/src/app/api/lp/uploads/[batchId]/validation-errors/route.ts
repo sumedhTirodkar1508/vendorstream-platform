@@ -31,6 +31,14 @@ function jsonObject(value: PrismaType.JsonValue): Record<string, unknown> {
     : {};
 }
 
+function listToText(value: unknown) {
+  if (Array.isArray(value)) {
+    return value.map((entry) => String(entry)).join("; ");
+  }
+
+  return typeof value === "string" ? value : "";
+}
+
 function errorsToText(value: PrismaType.JsonValue | null) {
   if (!value) {
     return "";
@@ -41,6 +49,69 @@ function errorsToText(value: PrismaType.JsonValue | null) {
   }
 
   return typeof value === "string" ? value : JSON.stringify(value);
+}
+
+function buildPrevalidationCsvRows(summary: Record<string, unknown>) {
+  return [
+    [
+      "Failure Type",
+      "Worksheet Name",
+      "Error Message",
+      "Missing Required Columns",
+      "Found Columns",
+      "Suggested Action",
+    ],
+    [
+      "Workbook structure/header validation failed",
+      typeof summary.worksheetName === "string" ? summary.worksheetName : "",
+      typeof summary.errorMessage === "string"
+        ? summary.errorMessage
+        : listToText(summary.errors),
+      listToText(summary.missingHeaders),
+      listToText(summary.foundHeaders),
+      "Use the required LP workbook headers exactly, then upload the corrected workbook again.",
+    ],
+  ];
+}
+
+function buildRowValidationCsvRows(
+  rows: Array<{
+    sourceRowNumber: number;
+    rawData: PrismaType.JsonValue;
+    parseErrors: PrismaType.JsonValue | null;
+  }>,
+) {
+  const header = ["Source Row Number", "Errors", ...LP_EXCEL_REQUIRED_HEADERS];
+
+  if (rows.length === 0) {
+    return [
+      header,
+      [
+        "",
+        "Failed row details are no longer retained for this batch.",
+        ...LP_EXCEL_REQUIRED_HEADERS.map(() => ""),
+      ],
+    ];
+  }
+
+  return [
+    header,
+    ...rows.map((row) => {
+      const rawData = jsonObject(row.rawData);
+
+      return [
+        row.sourceRowNumber,
+        errorsToText(row.parseErrors),
+        ...LP_EXCEL_REQUIRED_HEADERS.map((column) => {
+          const value = rawData[column] ?? "";
+          if (column === "Order Date" && typeof value === "string") {
+            return value.slice(0, 10);
+          }
+          return value;
+        }),
+      ];
+    }),
+  ];
 }
 
 export async function GET(_request: Request, context: RouteContext) {
@@ -123,33 +194,24 @@ export async function GET(_request: Request, context: RouteContext) {
     );
   }
 
-  const header = [
-    "Source Row Number",
-    "Errors",
-    ...LP_EXCEL_REQUIRED_HEADERS,
-    "Raw Data JSON",
-  ];
-  const rows =
-    batch.rawLpRows.length > 0
-      ? batch.rawLpRows.map((row) => {
-          const rawData = jsonObject(row.rawData);
+  if (
+    batch.status !== "PREVALIDATION_FAILED" &&
+    batch.status !== "VALIDATION_FAILED"
+  ) {
+    return NextResponse.json(
+      {
+        error: "This import batch does not have downloadable validation errors.",
+      },
+      { status: 409 },
+    );
+  }
 
-          return [
-            row.sourceRowNumber,
-            errorsToText(row.parseErrors),
-            ...LP_EXCEL_REQUIRED_HEADERS.map((column) => rawData[column] ?? ""),
-            rawData,
-          ];
-        })
-      : [
-          [
-            "",
-            errorsToText(batch.validationSummary),
-            ...LP_EXCEL_REQUIRED_HEADERS.map(() => ""),
-            batch.validationSummary ?? "",
-          ],
-        ];
-  const csv = [header, ...rows]
+  const csvRows =
+    batch.status === "PREVALIDATION_FAILED"
+      ? buildPrevalidationCsvRows(jsonObject(batch.validationSummary))
+      : buildRowValidationCsvRows(batch.rawLpRows);
+
+  const csv = csvRows
     .map((row) => row.map((cell) => csvCell(cell)).join(","))
     .join("\n");
 

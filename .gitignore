@@ -35,3 +35,7 @@ apps/worker/.env
 
 # Prisma
 /apps/web/src/generated/prisma
+
+# Graphify
+graphify-out/cache/
+graphify-out/.graphify_python

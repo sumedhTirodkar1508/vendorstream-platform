@@ -104,18 +104,13 @@ export async function startWorker(): Promise<void> {
   await boss.createQueue(JOBS.RECONCILE_CYCLE);
   await boss.createQueue(JOBS.GENERATE_STATEMENT);
   await boss.createQueue(JOBS.CLEANUP_FAILED_UPLOAD_ARTIFACTS);
-  await boss.schedule(
-    JOBS.CLEANUP_FAILED_UPLOAD_ARTIFACTS,
-    "0 3 * * *",
-    null,
-    {
-      retryLimit: 3,
-      retryDelay: 300,
-      retryBackoff: true,
-      retentionSeconds: 60 * 60 * 24 * 14,
-      expireInSeconds: 60 * 30,
-    },
-  );
+  await boss.schedule(JOBS.CLEANUP_FAILED_UPLOAD_ARTIFACTS, "0 3 * * *", null, {
+    retryLimit: 3,
+    retryDelay: 300,
+    retryBackoff: true,
+    retentionSeconds: 60 * 60 * 24 * 14,
+    expireInSeconds: 60 * 30,
+  });
 
   logger.info(
     {

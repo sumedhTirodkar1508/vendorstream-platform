@@ -60,7 +60,10 @@ export const LpExcelRowSchema = z.object({
   "Order Date": z.coerce.date(),
 
   // Rule 7.1: LP is the truth source for quantity
-  "Units Sold": z.preprocess(numericPreprocessor, z.number().min(0)),
+  "Units Sold": z.preprocess(
+    numericPreprocessor,
+    z.number().min(1, "Units Sold must be greater than 0"),
+  ),
 
   // Rule 5.1: Primary match key. (Coerce to string to preserve leading zeros)
   "Item Barcode": z.coerce.string().min(1, "Barcode is required"),
